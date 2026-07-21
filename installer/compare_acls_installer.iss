@@ -26,6 +26,13 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
+; Without these, Inno Setup silently reuses whatever install folder/Start
+; Menu group was recorded under this AppId from a PRIOR install (e.g. if
+; someone still has an old build installed from before the TFSync rename) -
+; ignoring DefaultDirName/DefaultGroupName above entirely. Forcing them off
+; guarantees every install (fresh or upgrade) lands in ...\TFSync.
+UsePreviousAppDir=no
+UsePreviousGroup=no
 DisableProgramGroupPage=yes
 OutputDir=installer_output
 OutputBaseFilename=TFSync_Setup
