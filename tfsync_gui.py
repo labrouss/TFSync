@@ -463,7 +463,21 @@ class JobEditorDialog(QDialog):
         creds_page = QWidget()
         creds_form = QFormLayout(creds_page)
         self.runas_user_edit = QLineEdit(existing_run_as or task_scheduler._current_user())
-        creds_form.addRow("Account:", self.runas_user_edit)
+        self.runas_user_edit.setPlaceholderText(r"DOMAIN\username or username@domain.com")
+        self.runas_user_edit.setToolTip(
+            "The Windows account this task logs on as - NOT the file server's address.\n"
+            r"e.g. HPEHELLAS-DEMO\svc_account or svc_account@hpehellas-demo.com" + "\n\n"
+            "It should already have access to the source/destination shares, the same "
+            "way your own account does when you run a sync manually."
+        )
+        creds_form.addRow("Windows account:", self.runas_user_edit)
+        account_hint = QLabel(
+            "This is the Windows login the task runs as (e.g. a domain account), "
+            "not the file server's hostname - it needs its own access to the shares."
+        )
+        account_hint.setWordWrap(True)
+        account_hint.setStyleSheet("color: #999; font-style: italic;")
+        creds_form.addRow(account_hint)
         self.runas_password_edit = QLineEdit()
         self.runas_password_edit.setEchoMode(QLineEdit.Password)
         self.runas_password_edit.setPlaceholderText(
@@ -607,6 +621,26 @@ class JobEditorDialog(QDialog):
         if self.runas_stored_radio.isChecked() and not self.runas_user_edit.text().strip():
             QMessageBox.warning(self, "Job Queue", "Please provide an account name for \u201cWhether logged on or not\u201d mode.")
             return
+        if self.runas_stored_radio.isChecked():
+            account = self.runas_user_edit.text().strip()
+            server_hosts = {
+                core.parse_unc_host(self.source_edit.text()).lstrip("\\").lower(),
+                core.parse_unc_host(self.dest_edit.text()).lstrip("\\").lower(),
+            }
+            server_hosts.discard("")
+            if account.lower().lstrip("\\") in server_hosts:
+                reply = QMessageBox.warning(
+                    self, "Job Queue",
+                    f"\u201c{account}\u201d looks like a file server address, not a Windows account.\n\n"
+                    f"The account field needs a login identity (e.g. DOMAIN\\username or "
+                    f"username@domain.com) that has access to the shares - not the server "
+                    f"you're syncing to/from. Task Scheduler will reject this with a "
+                    f"\u201cNo mapping between account names and security IDs\u201d error.\n\n"
+                    f"Save anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
         try:
             self._pending_schedule_expr = self._build_schedule_expr()
         except task_scheduler.ScheduleParseError as e:
