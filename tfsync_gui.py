@@ -23,7 +23,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QDir, QTime, QDate, QDateTime
 from PyQt5.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPalette
@@ -202,6 +202,9 @@ DIFF_TYPES = [
 
 JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
                "Auto-Verify ACL", "Enabled", "Last Status", "Next Run"]
+
+JOB_EXPORT_FIELDS = ["name", "source", "dest", "mode", "schedule_expr",
+                      "threads", "retries", "auto_verify_acl", "enabled"]
 
 HISTORY_COLUMNS = ["Start Time", "Job", "Source", "Destination", "Mode", "Dry Run",
                     "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
@@ -984,6 +987,12 @@ class MainWindow(QMainWindow):
             "scheduled jobs, removes tasks for disabled/unscheduled jobs, and cleans up orphans."
         )
         sync_schedules_btn.clicked.connect(self.on_sync_schedules_now)
+        export_jobs_btn = QPushButton("Export Jobs...")
+        export_jobs_btn.setToolTip("Save all job definitions to a JSON file")
+        export_jobs_btn.clicked.connect(self.on_export_jobs)
+        import_jobs_btn = QPushButton("Import Jobs...")
+        import_jobs_btn.setToolTip("Load job definitions from a JSON file (adds them as new jobs)")
+        import_jobs_btn.clicked.connect(self.on_import_jobs)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh_jobs_table)
         controls.addWidget(new_btn)
@@ -993,6 +1002,8 @@ class MainWindow(QMainWindow):
         controls.addWidget(run_btn)
         controls.addWidget(compare_btn)
         controls.addWidget(sync_schedules_btn)
+        controls.addWidget(export_jobs_btn)
+        controls.addWidget(import_jobs_btn)
         controls.addStretch()
         controls.addWidget(refresh_btn)
         layout.addLayout(controls)
@@ -1199,6 +1210,103 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_TITLE, msg)
         else:
             QMessageBox.information(self, APP_TITLE, msg)
+
+    def on_export_jobs(self) -> None:
+        jobs = store.list_jobs()
+        if not jobs:
+            QMessageBox.information(self, APP_TITLE, "No jobs to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Jobs", os.path.join(os.getcwd(), "tfsync_jobs_export.json"), "JSON files (*.json)"
+        )
+        if not path:
+            return
+        export_data = {
+            "tfsync_export_version": 1,
+            "jobs": [{field: job[field] for field in JOB_EXPORT_FIELDS} for job in jobs],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, indent=2)
+        except OSError as e:
+            QMessageBox.critical(self, APP_TITLE, f"Could not write file:\n{e}")
+            return
+        QMessageBox.information(self, APP_TITLE, f"Exported {len(jobs)} job(s) to:\n{path}")
+
+    def _validate_import_job(self, entry: Any) -> dict:
+        """Validates and normalizes one imported job entry. Raises ValueError
+        (with a short, specific reason) if the entry can't be used."""
+        if not isinstance(entry, dict):
+            raise ValueError("not a valid job entry")
+        name = str(entry.get("name", "")).strip()
+        source = str(entry.get("source", "")).strip()
+        dest = str(entry.get("dest", "")).strip()
+        if not name:
+            raise ValueError("missing name")
+        if not source or not dest:
+            raise ValueError("missing source or destination")
+        mode = entry.get("mode", "copy")
+        if mode not in ("copy", "mirror"):
+            raise ValueError(f"invalid mode '{mode}'")
+        schedule_expr = entry.get("schedule_expr") or None
+        if schedule_expr:
+            try:
+                task_scheduler.parse_schedule_expr(schedule_expr)
+            except task_scheduler.ScheduleParseError as e:
+                raise ValueError(f"invalid schedule '{schedule_expr}': {str(e).splitlines()[0]}")
+        try:
+            threads = int(entry.get("threads", 16))
+            retries = int(entry.get("retries", 3))
+        except (TypeError, ValueError):
+            raise ValueError("threads/retries must be numbers")
+        return {
+            "name": name, "source": source, "dest": dest, "mode": mode,
+            "schedule_expr": schedule_expr, "threads": threads, "retries": retries,
+            "auto_verify_acl": bool(entry.get("auto_verify_acl", False)),
+            "enabled": bool(entry.get("enabled", True)),
+        }
+
+    def on_import_jobs(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import Jobs", os.getcwd(), "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            QMessageBox.critical(self, APP_TITLE, f"Could not read file:\n{e}")
+            return
+
+        raw_jobs = data.get("jobs") if isinstance(data, dict) else data
+        if not isinstance(raw_jobs, list):
+            QMessageBox.critical(self, APP_TITLE, "This doesn't look like a TFSync jobs export file.")
+            return
+
+        valid, errors = [], []
+        for i, entry in enumerate(raw_jobs):
+            try:
+                valid.append(self._validate_import_job(entry))
+            except ValueError as e:
+                label = entry.get("name", "?") if isinstance(entry, dict) else "?"
+                errors.append(f"Entry {i + 1} (\u201c{label}\u201d): {e}")
+
+        if not valid:
+            QMessageBox.warning(self, APP_TITLE, "No valid jobs found in this file.\n\n" + "\n".join(errors))
+            return
+
+        msg = f"Import {len(valid)} job(s) as new entries?"
+        if errors:
+            msg += f"\n\n{len(errors)} entry/entries will be skipped:\n" + "\n".join(errors)
+        reply = QMessageBox.question(self, APP_TITLE, msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        created_ids = [store.create_job(**job) for job in valid]
+        self.refresh_jobs_table()
+        for job_id in created_ids:
+            self._sync_job_schedule(job_id)  # registers Task Scheduler tasks where applicable; no-op off Windows
+
+        QMessageBox.information(self, APP_TITLE, f"Imported {len(created_ids)} job(s).")
 
     def on_run_job_now(self) -> None:
         job_id = self._selected_job_id()

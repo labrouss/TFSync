@@ -88,6 +88,23 @@ A few other notes on how the queue behaves:
   licensing quota are kept regardless, since those bytes were actually
   transferred whether or not the job/its logs still exist.
 
+**Export Jobs / Import Jobs**: back up your job definitions to a JSON
+file, move them to another machine, or bulk-create several similar jobs by
+hand-editing the exported file before importing it back.
+- **Export Jobs...** writes every job's portable settings (name, source,
+  dest, mode, schedule, threads, retries, auto-verify ACL, enabled) to a
+  JSON file you choose. Run history, job IDs, and Task Scheduler
+  registration state aren't part of the export - only the definitions.
+- **Import Jobs...** reads a JSON file and adds each entry as a **new**
+  job (existing jobs are never overwritten, so importing the same file
+  twice creates duplicates - delete the old ones first if that's not what
+  you want). Each entry is validated before anything is created: missing
+  name/source/dest, an invalid mode, or an unparseable schedule expression
+  gets that one entry skipped, listed by name in the confirmation dialog,
+  without blocking the rest of the file from importing. Imported jobs that
+  are enabled and scheduled get their Task Scheduler task registered
+  automatically, the same as creating them by hand.
+
 ## Run History (GUI tab 4)
 
 Every sync run - manual (from tab 1) or from the Job Queue - is logged to
