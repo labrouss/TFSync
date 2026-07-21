@@ -236,6 +236,18 @@ def _runner_command(job_id: str) -> str:
     return f'"{sys.executable}" "{script}" --job-id {job_id}'
 
 
+def _redact_args(args: List[str]) -> List[str]:
+    """Returns a copy of args with the value following /RP replaced with
+    asterisks - used any time a schtasks command line might be shown to
+    the user (error messages, dialogs) so a password never appears in
+    clear text, even in a failure message."""
+    redacted = list(args)
+    for i, arg in enumerate(redacted):
+        if arg == "/RP" and i + 1 < len(redacted):
+            redacted[i + 1] = "********"
+    return redacted
+
+
 def _run_schtasks(args: List[str], allow_not_found: bool = False) -> subprocess.CompletedProcess:
     _require_windows()
     proc = subprocess.run(["schtasks.exe", *args], capture_output=True, text=True)
@@ -243,7 +255,15 @@ def _run_schtasks(args: List[str], allow_not_found: bool = False) -> subprocess.
         stderr = (proc.stderr or proc.stdout or "").strip()
         if allow_not_found and ("cannot find" in stderr.lower() or "does not exist" in stderr.lower()):
             return proc
-        raise TaskSchedulerError(f"schtasks {' '.join(args)} failed:\n{stderr}")
+        # Defense in depth: if the actual password appears anywhere in schtasks' own
+        # output (e.g. it echoing the command line back), scrub it too - not just our
+        # own rendering of the args below.
+        for i, arg in enumerate(args):
+            if arg == "/RP" and i + 1 < len(args):
+                raw_password = args[i + 1]
+                if raw_password:
+                    stderr = stderr.replace(raw_password, "********")
+        raise TaskSchedulerError(f"schtasks {' '.join(_redact_args(args))} failed:\n{stderr}")
     return proc
 
 

@@ -78,7 +78,10 @@ you only ever run manually.
   after editing the job, after "Sync Schedules Now" (which prompts for it,
   once per distinct account, only for jobs that need it), or after
   importing a job that had this mode set (exports include the account name
-  but never a password, for the same reason).
+  but never a password, for the same reason). If registration ever fails
+  (e.g. a bad account name), the error dialog shows the `schtasks` command
+  that was attempted for troubleshooting - with the password always masked
+  as `********`, never shown in clear text.
 - This also happens to be the standard fix for `robocopy` failing under
   Task Scheduler with `ERROR 1326 - The user name or password is
   incorrect` when accessing a share that relies on cached network
