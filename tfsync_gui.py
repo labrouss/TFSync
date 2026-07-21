@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QCheckBox, QLabel, QProgressBar, QPlainTextEdit,
     QTableView, QFileDialog, QMessageBox, QGroupBox, QComboBox, QHeaderView,
     QSplitter, QStyleFactory, QSpinBox, QTabWidget, QRadioButton, QButtonGroup,
-    QDialog, QDialogButtonBox, QAbstractItemView, QTimeEdit, QDateTimeEdit, QStackedWidget,
+    QDialog, QDialogButtonBox, QAbstractItemView, QTimeEdit, QDateTimeEdit, QStackedWidget, QInputDialog,
 )
 
 import acl_compare_core as core
@@ -201,10 +201,10 @@ DIFF_TYPES = [
 ]
 
 JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
-               "Auto-Verify ACL", "Enabled", "Last Status", "Next Run"]
+               "Auto-Verify ACL", "Enabled", "Run As", "Last Status", "Next Run"]
 
 JOB_EXPORT_FIELDS = ["name", "source", "dest", "mode", "schedule_expr",
-                      "threads", "retries", "auto_verify_acl", "enabled"]
+                      "threads", "retries", "auto_verify_acl", "enabled", "run_as_user"]
 
 HISTORY_COLUMNS = ["Start Time", "Job", "Source", "Destination", "Mode", "Dry Run",
                     "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
@@ -443,6 +443,60 @@ class JobEditorDialog(QDialog):
 
         self._load_schedule_into_ui(job["schedule_expr"] if job else None)
 
+        existing_run_as = (job.get("run_as_user") if job else None) or None
+
+        run_as_box = QGroupBox("Run As (Task Scheduler)")
+        run_as_layout = QVBoxLayout()
+        run_as_mode_row = QHBoxLayout()
+        self.runas_interactive_radio = QRadioButton("While I'm logged on (no password needed)")
+        self.runas_stored_radio = QRadioButton("Whether logged on or not (needs a Windows password)")
+        runas_group = QButtonGroup(self)
+        runas_group.addButton(self.runas_interactive_radio)
+        runas_group.addButton(self.runas_stored_radio)
+        run_as_mode_row.addWidget(self.runas_interactive_radio)
+        run_as_mode_row.addWidget(self.runas_stored_radio)
+        run_as_layout.addLayout(run_as_mode_row)
+
+        self.runas_stack = QStackedWidget()
+        self.runas_stack.addWidget(QWidget())  # index 0: interactive - nothing to configure
+
+        creds_page = QWidget()
+        creds_form = QFormLayout(creds_page)
+        self.runas_user_edit = QLineEdit(existing_run_as or task_scheduler._current_user())
+        creds_form.addRow("Account:", self.runas_user_edit)
+        self.runas_password_edit = QLineEdit()
+        self.runas_password_edit.setEchoMode(QLineEdit.Password)
+        self.runas_password_edit.setPlaceholderText(
+            "Re-enter to (re)register - never stored, only sent to Task Scheduler"
+            if existing_run_as else "Required to register this schedule"
+        )
+        creds_form.addRow("Password:", self.runas_password_edit)
+        creds_note = QLabel(
+            "Not saved anywhere by TFSync - only passed to schtasks.exe when this job is "
+            "(re)registered, then discarded. You'll need to re-enter it whenever the "
+            "schedule needs to be (re)registered, including via \u201cSync Schedules Now\u201d."
+        )
+        creds_note.setWordWrap(True)
+        creds_note.setStyleSheet("color: #999; font-style: italic;")
+        creds_form.addRow(creds_note)
+        self.runas_stack.addWidget(creds_page)
+        run_as_layout.addWidget(self.runas_stack)
+        run_as_box.setLayout(run_as_layout)
+        form.addRow(run_as_box)
+
+        self.runas_interactive_radio.toggled.connect(
+            lambda checked: self.runas_stack.setCurrentIndex(0) if checked else None
+        )
+        self.runas_stored_radio.toggled.connect(
+            lambda checked: self.runas_stack.setCurrentIndex(1) if checked else None
+        )
+        if existing_run_as:
+            self.runas_stored_radio.setChecked(True)
+            self.runas_stack.setCurrentIndex(1)
+        else:
+            self.runas_interactive_radio.setChecked(True)
+            self.runas_stack.setCurrentIndex(0)
+
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 128)
         self.threads_spin.setValue(job["threads"] if job else 16)
@@ -550,12 +604,24 @@ class JobEditorDialog(QDialog):
         if not self.source_edit.text().strip() or not self.dest_edit.text().strip():
             QMessageBox.warning(self, "Job Queue", "Please provide both a source and destination path.")
             return
+        if self.runas_stored_radio.isChecked() and not self.runas_user_edit.text().strip():
+            QMessageBox.warning(self, "Job Queue", "Please provide an account name for \u201cWhether logged on or not\u201d mode.")
+            return
         try:
             self._pending_schedule_expr = self._build_schedule_expr()
         except task_scheduler.ScheduleParseError as e:
             QMessageBox.warning(self, "Job Queue", str(e))
             return
         self.accept()
+
+    def get_entered_password(self) -> Optional[str]:
+        """Returns the password typed for stored-credential mode, or None
+        (interactive mode never needs one, and this is never persisted to
+        the job definition itself - callers must use it immediately to
+        register the scheduled task, then discard it)."""
+        if self.runas_stored_radio.isChecked():
+            return self.runas_password_edit.text() or None
+        return None
 
     def values(self) -> dict:
         return {
@@ -568,6 +634,7 @@ class JobEditorDialog(QDialog):
             "retries": self.retries_spin.value(),
             "auto_verify_acl": self.auto_verify_chk.isChecked(),
             "enabled": self.enabled_chk.isChecked(),
+            "run_as_user": self.runas_user_edit.text().strip() if self.runas_stored_radio.isChecked() else None,
         }
 
 
@@ -1036,6 +1103,7 @@ class MainWindow(QMainWindow):
         self.jobs_model.removeRows(0, self.jobs_model.rowCount())
         for job in store.list_jobs():
             next_run = self._next_run_display(job)
+            run_as_display = job["run_as_user"] if job.get("run_as_user") else "Interactive (you)"
             row = [
                 QStandardItem(job["name"]),
                 QStandardItem(job["source"]),
@@ -1045,6 +1113,7 @@ class MainWindow(QMainWindow):
                 QStandardItem(str(job["threads"])),
                 QStandardItem("Yes" if job["auto_verify_acl"] else "No"),
                 QStandardItem("Yes" if job["enabled"] else "No"),
+                QStandardItem(run_as_display),
                 QStandardItem(job["last_run_status"] or "Never run"),
                 QStandardItem(next_run),
             ]
@@ -1096,9 +1165,10 @@ class MainWindow(QMainWindow):
         dialog = JobEditorDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             values = dialog.values()
+            password = dialog.get_entered_password()
             job_id = store.create_job(**values)
             self.refresh_jobs_table()
-            self._sync_job_schedule(job_id)
+            self._sync_job_schedule(job_id, password=password)
 
     def on_edit_job(self) -> None:
         job_id = self._selected_job_id()
@@ -1108,9 +1178,10 @@ class MainWindow(QMainWindow):
         job = store.get_job(job_id)
         dialog = JobEditorDialog(self, job=job)
         if dialog.exec_() == QDialog.Accepted:
+            password = dialog.get_entered_password()
             store.update_job(job_id, **dialog.values())
             self.refresh_jobs_table()
-            self._sync_job_schedule(job_id)
+            self._sync_job_schedule(job_id, password=password)
 
     def on_clone_job(self) -> None:
         job_id = self._selected_job_id()
@@ -1124,15 +1195,18 @@ class MainWindow(QMainWindow):
         clone_seed["name"] = f"{source_job['name']} (Copy)"
         dialog = JobEditorDialog(self, job=clone_seed, window_title="Clone Job")
         if dialog.exec_() == QDialog.Accepted:
+            password = dialog.get_entered_password()
             new_job_id = store.create_job(**dialog.values())
             self.refresh_jobs_table()
-            self._sync_job_schedule(new_job_id)
+            self._sync_job_schedule(new_job_id, password=password)
 
-    def _sync_job_schedule(self, job_id: str) -> None:
+    def _sync_job_schedule(self, job_id: str, password: Optional[str] = None) -> None:
         """
         Registers/updates or removes the job's Windows scheduled task so
         Task Scheduler matches the job definition just saved. A no-op on
-        non-Windows (there's nothing to register against).
+        non-Windows (there's nothing to register against). `password` is
+        only used immediately for this one registration call (for a
+        "whether logged on or not" job) - it is never persisted.
         """
         if os.name != "nt":
             return
@@ -1141,9 +1215,16 @@ class MainWindow(QMainWindow):
             return
         try:
             if job["enabled"] and job["schedule_expr"]:
-                task_scheduler.register_task(job)
+                task_scheduler.register_task(job, password=password)
             else:
                 task_scheduler.delete_task(job_id)
+        except task_scheduler.MissingCredentialsError as e:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                f"Job saved, but its schedule needs a password to register:\n{e}\n\n"
+                f"Edit the job again and enter the password, or use \u201cSync Schedules Now\u201d "
+                f"which will prompt for it."
+            )
         except (task_scheduler.TaskSchedulerError, task_scheduler.ScheduleParseError) as e:
             QMessageBox.warning(
                 self, APP_TITLE,
@@ -1197,8 +1278,23 @@ class MainWindow(QMainWindow):
         if os.name != "nt":
             QMessageBox.information(self, APP_TITLE, "Task Scheduler integration requires Windows.")
             return
+        jobs = store.list_jobs()
+
+        passwords = {}
+        for user in task_scheduler.get_required_credential_users(jobs):
+            pw, ok = QInputDialog.getText(
+                self, APP_TITLE,
+                f"Enter the Windows password for \u201c{user}\u201d to (re)register its scheduled "
+                f"job(s) (runs whether logged on or not).\n\n"
+                f"This is not saved anywhere - only passed to Task Scheduler for this operation.\n"
+                f"Leave blank/Cancel to skip that account's job(s) for now.",
+                QLineEdit.Password,
+            )
+            if ok and pw:
+                passwords[user] = pw
+
         try:
-            summary = task_scheduler.reconcile_all(store.list_jobs())
+            summary = task_scheduler.reconcile_all(jobs, passwords=passwords)
         except task_scheduler.TaskSchedulerError as e:
             QMessageBox.critical(self, APP_TITLE, f"Could not sync schedules:\n{e}")
             return
@@ -1259,11 +1355,13 @@ class MainWindow(QMainWindow):
             retries = int(entry.get("retries", 3))
         except (TypeError, ValueError):
             raise ValueError("threads/retries must be numbers")
+        run_as_user = str(entry.get("run_as_user") or "").strip() or None
         return {
             "name": name, "source": source, "dest": dest, "mode": mode,
             "schedule_expr": schedule_expr, "threads": threads, "retries": retries,
             "auto_verify_acl": bool(entry.get("auto_verify_acl", False)),
             "enabled": bool(entry.get("enabled", True)),
+            "run_as_user": run_as_user,
         }
 
     def on_import_jobs(self) -> None:
@@ -1294,9 +1392,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_TITLE, "No valid jobs found in this file.\n\n" + "\n".join(errors))
             return
 
+        needs_password = [job["name"] for job in valid if job.get("run_as_user")]
         msg = f"Import {len(valid)} job(s) as new entries?"
         if errors:
             msg += f"\n\n{len(errors)} entry/entries will be skipped:\n" + "\n".join(errors)
+        if needs_password:
+            msg += (f"\n\n{len(needs_password)} job(s) are set to run whether logged on or "
+                    f"not and will need their password re-entered afterward (Edit Job, or "
+                    f"\u201cSync Schedules Now\u201d) - passwords are never included in exports:\n"
+                    + "\n".join(needs_password))
         reply = QMessageBox.question(self, APP_TITLE, msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return

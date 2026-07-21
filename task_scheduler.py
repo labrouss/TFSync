@@ -57,6 +57,12 @@ class TaskSchedulerError(RuntimeError):
     pass
 
 
+class MissingCredentialsError(TaskSchedulerError):
+    """Raised when a job is set to run whether logged on or not (has a
+    run_as_user) but no password was supplied to register its task."""
+    pass
+
+
 # --------------------------------------------------------------------------
 # Schedule expression parsing (pure logic - no OS dependency)
 # --------------------------------------------------------------------------
@@ -241,21 +247,43 @@ def _run_schtasks(args: List[str], allow_not_found: bool = False) -> subprocess.
     return proc
 
 
-def register_task(job: Dict[str, Any]) -> None:
+def register_task(job: Dict[str, Any], password: Optional[str] = None) -> None:
     """
     Creates or updates (idempotent - /F overwrites) the scheduled task for
     a job, per its schedule_expr. Raises ScheduleParseError if the
     expression is invalid, or TaskSchedulerError if schtasks itself fails.
+
+    Two run modes, based on job["run_as_user"]:
+    - Not set (None/empty) - interactive-only mode: registers under the
+      CURRENT Windows user with /IT (no password needed, matches the
+      original behavior). The task only fires while that user is logged
+      on interactively.
+    - Set - "whether logged on or not" mode: registers under
+      job["run_as_user"] with /RU + /RP <password>. Requires `password`
+      to be passed in; it is NEVER stored - only handed to schtasks for
+      this one call and then discarded. Raises MissingCredentialsError if
+      the job needs this mode but no password was given.
     """
     schedule_args = parse_schedule_expr(job["schedule_expr"])
+    run_as_user = (job.get("run_as_user") or "").strip()
+
     args = [
         "/Create", "/F",
         "/TN", _task_name(job["job_id"]),
         "/TR", _runner_command(job["job_id"]),
         *schedule_args,
-        "/RU", _current_user(),
-        "/IT",
     ]
+
+    if run_as_user:
+        if not password:
+            raise MissingCredentialsError(
+                f"Job '{job.get('name', job['job_id'])}' is set to run whether logged on or "
+                f"not (account: {run_as_user}) but no password was supplied."
+            )
+        args += ["/RU", run_as_user, "/RP", password]
+    else:
+        args += ["/RU", _current_user(), "/IT"]
+
     _run_schtasks(args)
 
 
@@ -311,7 +339,24 @@ def _list_tfsync_task_job_ids() -> List[str]:
     return job_ids
 
 
-def reconcile_all(jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
+def get_required_credential_users(jobs: List[Dict[str, Any]]) -> List[str]:
+    """
+    Returns the distinct run_as_user values (in "whether logged on or not"
+    mode) among jobs that should currently be scheduled (enabled + has a
+    schedule_expr). The GUI uses this to know which accounts it needs to
+    prompt for a password before calling reconcile_all - once per distinct
+    account, not once per job.
+    """
+    users = set()
+    for job in jobs:
+        should_be_scheduled = bool(job["enabled"]) and bool(job.get("schedule_expr"))
+        run_as_user = (job.get("run_as_user") or "").strip()
+        if should_be_scheduled and run_as_user:
+            users.add(run_as_user)
+    return sorted(users)
+
+
+def reconcile_all(jobs: List[Dict[str, Any]], passwords: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """
     Full reconciliation between the jobs database and what's actually
     registered in Task Scheduler:
@@ -319,9 +364,17 @@ def reconcile_all(jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
       - removes the task for every disabled/unscheduled job
       - removes any orphaned \\TFSync\\* task whose job no longer exists
         in the database at all (e.g. deleted outside the normal flow)
+
+    `passwords` maps run_as_user -> password for any "whether logged on or
+    not" jobs being (re)registered here; get_required_credential_users()
+    tells the caller which accounts to collect a password for first. Jobs
+    needing a password that isn't in this dict are skipped with an error
+    in the summary, rather than failing the whole reconciliation.
+
     Returns a summary dict for a confirmation dialog. Windows only.
     """
     _require_windows()
+    passwords = passwords or {}
     registered, removed, errors = 0, 0, []
 
     known_ids = {job["job_id"] for job in jobs}
@@ -330,7 +383,8 @@ def reconcile_all(jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
         should_be_scheduled = bool(job["enabled"]) and bool(job.get("schedule_expr"))
         try:
             if should_be_scheduled:
-                register_task(job)
+                run_as_user = (job.get("run_as_user") or "").strip()
+                register_task(job, password=passwords.get(run_as_user) if run_as_user else None)
                 registered += 1
             else:
                 delete_task(job["job_id"])

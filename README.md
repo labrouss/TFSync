@@ -58,13 +58,37 @@ you only ever run manually.
 - The **Next Run** column reflects Task Scheduler's own "Next Run Time"
   for that task (via `schtasks /Query`), or explains why there isn't one
   (not scheduled, not yet registered, or "N/A" off Windows).
-- **Current limitation**: registered tasks run under your own Windows
-  account using an interactive-only token (`schtasks /RU <you> /IT`) - no
-  password is requested or stored. That means a job fires while you're
-  logged on, but **not** across a full logoff or a reboot with nobody
-  logged in. Supporting that would mean prompting for and passing a
-  Windows account password to `schtasks` (`/RU` + `/RP`), which this first
-  cut deliberately avoids to sidestep handling a plaintext credential.
+- **Run As** (in the job editor, under the Schedule section) controls
+  which Windows identity the task runs under - see below.
+
+**Run As: interactive-only vs. whether logged on or not.** Each job picks one:
+- **While I'm logged on** (default, no password needed) - registers with
+  `schtasks /RU <you> /IT`. The job only fires while you're logged on
+  interactively; it will **not** run across a full logoff or a reboot with
+  nobody logged in. This is the same behavior as before and is the right
+  choice if TFSync (or at least your desktop session) is always running
+  when the schedule fires.
+- **Whether logged on or not** - registers with `schtasks /RU <account>
+  /RP <password>`, which lets Windows run the task even fully logged off.
+  You provide an account name (defaults to your current one, but can be a
+  service account) and its password right in the job editor. **The
+  password is never stored anywhere by TFSync** - it's passed straight to
+  `schtasks.exe` for that one registration call and then discarded, so
+  you'll need to re-enter it any time the task needs to be (re)registered:
+  after editing the job, after "Sync Schedules Now" (which prompts for it,
+  once per distinct account, only for jobs that need it), or after
+  importing a job that had this mode set (exports include the account name
+  but never a password, for the same reason).
+- This also happens to be the standard fix for `robocopy` failing under
+  Task Scheduler with `ERROR 1326 - The user name or password is
+  incorrect` when accessing a share that relies on cached network
+  credentials (e.g. Credential Manager) rather than domain SSO: an
+  interactive-only task doesn't inherit those, since it isn't really your
+  logged-in session. Switching that job to "whether logged on or not"
+  gives it a real logon with its own credentials instead. (The other
+  standard fix, without changing anything in TFSync, is
+  `cmdkey /add:<server> /user:<account> /pass:<password>` under the same
+  Windows account the task runs as - either works.)
 
 A few other notes on how the queue behaves:
 
@@ -361,10 +385,14 @@ report path currently shown in "Output CSV".
 
 ## Known limitations
 
-- Scheduled tasks run under your current Windows account with an
-  interactive-only token (`/RU <you> /IT`, no password stored) - they
-  fire while you're logged on, but **not** across a full logoff or a
-  reboot with nobody logged in. See the Job Queue section above.
+- Scheduled tasks default to running under your current Windows account
+  with an interactive-only token (`/RU <you> /IT`, no password stored) -
+  they fire while you're logged on, but **not** across a full logoff or a
+  reboot with nobody logged in. Per-job, you can switch to "whether logged
+  on or not" mode instead (`/RU <account> /RP <password>`), which does run
+  logged-off/rebooted - see "Run As" in the Job Queue section above. That
+  mode's password is entered per-job and never stored, so it needs
+  re-entering whenever the task is (re)registered.
 - Same-location detection (`paths_are_same`) is a normalized string
   comparison; it won't catch two different paths that happen to resolve to
   the same underlying share (e.g. a mapped drive letter vs. its UNC path, or

@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     retries          INTEGER NOT NULL DEFAULT 3,
     auto_verify_acl  INTEGER NOT NULL DEFAULT 0,       -- chain an ACL comparison after sync
     enabled          INTEGER NOT NULL DEFAULT 1,
+    run_as_user      TEXT,                              -- NULL/empty = interactive-only (/IT, no password, current
+                                                          -- behavior); set = "whether logged on or not" mode, task
+                                                          -- registered with /RU <run_as_user> /RP <password>.
+                                                          -- The password itself is NEVER stored - only handed to
+                                                          -- schtasks at registration time and then discarded.
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
     last_run_id      TEXT,
@@ -149,11 +154,15 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
 
 
 def _migrate_columns(conn: sqlite3.Connection) -> None:
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(run_history)").fetchall()}
-    if "acl_report_path" not in existing:
+    run_history_cols = {row["name"] for row in conn.execute("PRAGMA table_info(run_history)").fetchall()}
+    if "acl_report_path" not in run_history_cols:
         conn.execute("ALTER TABLE run_history ADD COLUMN acl_report_path TEXT")
-    if "log_path" not in existing:
+    if "log_path" not in run_history_cols:
         conn.execute("ALTER TABLE run_history ADD COLUMN log_path TEXT")
+
+    jobs_cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "run_as_user" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN run_as_user TEXT")
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +179,7 @@ def create_job(
     retries: int = 3,
     auto_verify_acl: bool = False,
     enabled: bool = True,
+    run_as_user: Optional[str] = None,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> str:
     """Creates a job definition and returns its job_id."""
@@ -179,10 +189,10 @@ def create_job(
         conn.execute(
             """INSERT INTO jobs
                (job_id, name, source, dest, mode, schedule_expr, threads,
-                retries, auto_verify_acl, enabled, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                retries, auto_verify_acl, enabled, run_as_user, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, name, source, dest, mode, schedule_expr, threads,
-             retries, int(auto_verify_acl), int(enabled), now, now),
+             retries, int(auto_verify_acl), int(enabled), run_as_user or None, now, now),
         )
     return job_id
 
