@@ -1341,6 +1341,14 @@ class MainWindow(QMainWindow):
         self.history_job_combo.currentIndexChanged.connect(self.refresh_history_table)
         filter_row.addWidget(self.history_job_combo)
         filter_row.addStretch()
+        delete_selected_btn = QPushButton("Delete Selected")
+        delete_selected_btn.setToolTip("Delete the selected run(s) from history (Ctrl/Shift-click to select multiple)")
+        delete_selected_btn.clicked.connect(self.on_delete_selected_history)
+        filter_row.addWidget(delete_selected_btn)
+        delete_all_btn = QPushButton("Delete All (shown)")
+        delete_all_btn.setToolTip("Delete all run history matching the current Job filter above")
+        delete_all_btn.clicked.connect(self.on_delete_all_history)
+        filter_row.addWidget(delete_all_btn)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh_history_table)
         filter_row.addWidget(refresh_btn)
@@ -1352,6 +1360,8 @@ class MainWindow(QMainWindow):
         self.history_table.setModel(self.history_model)
         self.history_table.setSortingEnabled(True)
         self.history_table.setEditTriggers(QTableView.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.history_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.history_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.Stretch)
@@ -1453,6 +1463,7 @@ class MainWindow(QMainWindow):
                 QStandardItem(run["description"]),
                 QStandardItem(acl_col),
             ]
+            row[0].setData(run["run_id"], Qt.UserRole)
             if run["is_failure"]:
                 for item in row:
                     item.setBackground(QBrush(QColor("#f8d7da")))
@@ -1467,6 +1478,47 @@ class MainWindow(QMainWindow):
             f"Showing {shown} run(s){' (limited to 200)' if shown == 200 else ''} - "
             f"{total_rows} total in database - retention policy: {policy_text}."
         )
+
+    def on_delete_selected_history(self) -> None:
+        selection_model = self.history_table.selectionModel()
+        if not selection_model or not selection_model.selectedRows():
+            QMessageBox.information(self, APP_TITLE, "Select one or more rows in the table first "
+                                                       "(Ctrl-click or Shift-click to select multiple).")
+            return
+        run_ids = [self.history_model.item(index.row(), 0).data(Qt.UserRole)
+                   for index in selection_model.selectedRows()]
+        run_ids = [rid for rid in run_ids if rid]
+        reply = QMessageBox.question(
+            self, APP_TITLE,
+            f"Delete {len(run_ids)} selected run history record(s)? This cannot be undone.\n\n"
+            f"(Lifetime usage totals for licensing are unaffected.)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        deleted = sum(1 for rid in run_ids if store.delete_run(rid))
+        self.refresh_history_table()
+        QMessageBox.information(self, APP_TITLE, f"Deleted {deleted} run history record(s).")
+
+    def on_delete_all_history(self) -> None:
+        job_id = self.history_job_combo.currentData()
+        job_name = self.history_job_combo.currentText()
+        count = store.count_run_history(job_id)
+        if count == 0:
+            QMessageBox.information(self, APP_TITLE, "No run history to delete for the current filter.")
+            return
+        scope_desc = "ALL run history (every job and every manual run)" if not job_id else f"all run history for \u201c{job_name}\u201d"
+        reply = QMessageBox.question(
+            self, APP_TITLE,
+            f"Delete {scope_desc}?\n\nThis deletes {count} record(s) and cannot be undone.\n\n"
+            f"(Lifetime usage totals for licensing are unaffected.)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        deleted = store.delete_all_run_history(job_id)
+        self.refresh_history_table()
+        QMessageBox.information(self, APP_TITLE, f"Deleted {deleted} run history record(s).")
 
     def _auto_fill_from_source(self, text: str) -> None:
         host = core.parse_unc_host(text)

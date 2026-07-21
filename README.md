@@ -97,6 +97,17 @@ bytes copied, derived MB/s and seconds-per-GB, exit code + description,
 and any chained ACL comparison summary. Filter by job (or "All runs") and
 hit Refresh to pull the latest. Failed runs are highlighted in red.
 
+**Manual deletion**: alongside automatic retention (below), you can also
+remove history by hand:
+- **Delete Selected** - deletes just the row(s) you've selected in the
+  table (Ctrl-click or Shift-click to select more than one).
+- **Delete All (shown)** - deletes everything matching the current Job
+  filter above it: pick a specific job to wipe just that job's history,
+  or "All runs" to clear the entire run history table.
+
+Both ask for confirmation first and, like retention pruning, never touch
+the lifetime usage ledger used for the licensing quota.
+
 **Retention**: history is capped per job (and separately for manual/ad-hoc
 runs) so the database doesn't grow forever. Options, top of the Run
 History tab:

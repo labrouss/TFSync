@@ -345,6 +345,28 @@ def update_run_acl_summary(run_id: str, acl_summary: Dict[str, int], db_path: Pa
         )
 
 
+def delete_run(run_id: str, db_path: Path = DEFAULT_DB_PATH) -> bool:
+    """Deletes a single run_history row. Does not touch usage_ledger, so
+    lifetime quota totals are unaffected. Returns True if a row was deleted."""
+    with _connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM run_history WHERE run_id = ?", (run_id,))
+    return cur.rowcount > 0
+
+
+def delete_all_run_history(job_id: Optional[str] = None, db_path: Path = DEFAULT_DB_PATH) -> int:
+    """
+    Deletes run_history rows in bulk: all of them if job_id is None, or
+    just the ones for a specific job_id. Does not touch usage_ledger, so
+    lifetime quota totals are unaffected. Returns the number of rows deleted.
+    """
+    with _connect(db_path) as conn:
+        if job_id:
+            cur = conn.execute("DELETE FROM run_history WHERE job_id = ?", (job_id,))
+        else:
+            cur = conn.execute("DELETE FROM run_history")
+    return cur.rowcount
+
+
 def list_run_history(
     job_id: Optional[str] = None,
     limit: int = 100,
