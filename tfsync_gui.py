@@ -752,12 +752,16 @@ class MainWindow(QMainWindow):
         delete_btn.clicked.connect(self.on_delete_job)
         run_btn = QPushButton("Run Now")
         run_btn.clicked.connect(self.on_run_job_now)
+        compare_btn = QPushButton("Compare...")
+        compare_btn.setToolTip("Open the Compare ACLs tab with this job's source/dest/threads filled in")
+        compare_btn.clicked.connect(self.on_compare_job)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh_jobs_table)
         controls.addWidget(new_btn)
         controls.addWidget(edit_btn)
         controls.addWidget(delete_btn)
         controls.addWidget(run_btn)
+        controls.addWidget(compare_btn)
         controls.addStretch()
         controls.addWidget(refresh_btn)
         layout.addLayout(controls)
@@ -849,6 +853,19 @@ class MainWindow(QMainWindow):
             store.delete_job(job_id)
             self.refresh_jobs_table()
             self.refresh_history_table()
+
+    def on_compare_job(self) -> None:
+        job_id = self._selected_job_id()
+        if not job_id:
+            QMessageBox.information(self, APP_TITLE, "Select a job first.")
+            return
+        job = store.get_job(job_id)
+        if not job:
+            return
+        self.source_edit.setText(job["source"])
+        self.dest_edit.setText(job["dest"])
+        self.threads_spin.setValue(job["threads"])
+        self.tabs.setCurrentIndex(1)
 
     def on_run_job_now(self) -> None:
         job_id = self._selected_job_id()
