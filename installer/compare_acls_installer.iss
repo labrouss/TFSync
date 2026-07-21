@@ -8,6 +8,8 @@
 ; Expects the following to already exist (built by build.bat or CI first):
 ;   dist\compare_acls.exe
 ;   dist\tfsync_gui.exe
+;   dist\sync_shares.exe
+;   dist\run_scheduled_job.exe
 ;   dist\decode_mask.exe
 
 #define MyAppName "TFSync"
@@ -46,6 +48,7 @@ Name: "addtopath"; Description: "Add install folder to PATH (lets you run compar
 Source: "..\dist\compare_acls.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\tfsync_gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\sync_shares.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\run_scheduled_job.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\decode_mask.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 

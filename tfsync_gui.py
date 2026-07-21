@@ -22,20 +22,22 @@ import os
 import sys
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QDir
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QDir, QTime, QDate, QDateTime
 from PyQt5.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPalette
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QCheckBox, QLabel, QProgressBar, QPlainTextEdit,
     QTableView, QFileDialog, QMessageBox, QGroupBox, QComboBox, QHeaderView,
     QSplitter, QStyleFactory, QSpinBox, QTabWidget, QRadioButton, QButtonGroup,
-    QDialog, QDialogButtonBox, QAbstractItemView,
+    QDialog, QDialogButtonBox, QAbstractItemView, QTimeEdit, QDateTimeEdit, QStackedWidget,
 )
 
 import acl_compare_core as core
 import robocopy_sync
 import tfsync_store as store
+import task_scheduler
 
 APP_TITLE = "TFSync — Total File Sync"
 
@@ -198,7 +200,7 @@ DIFF_TYPES = [
 ]
 
 JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
-               "Auto-Verify ACL", "Enabled", "Last Status"]
+               "Auto-Verify ACL", "Enabled", "Last Status", "Next Run"]
 
 HISTORY_COLUMNS = ["Start Time", "Job", "Source", "Destination", "Mode", "Dry Run",
                     "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
@@ -293,10 +295,11 @@ class JobEditorDialog(QDialog):
     anything with Windows Task Scheduler.
     """
 
-    def __init__(self, parent=None, job: dict = None):
+    def __init__(self, parent=None, job: dict = None, window_title: str = None):
         super().__init__(parent)
         self.job = job
-        self.setWindowTitle("Edit Job" if job else "New Job")
+        self._pending_schedule_expr: Optional[str] = None
+        self.setWindowTitle(window_title or ("Edit Job" if job else "New Job"))
         self.setMinimumWidth(480)
 
         layout = QVBoxLayout(self)
@@ -328,11 +331,113 @@ class JobEditorDialog(QDialog):
         mode_row.addWidget(self.mode_mirror_radio)
         form.addRow("Mode:", mode_row)
 
-        self.schedule_edit = QLineEdit(job["schedule_expr"] if job and job.get("schedule_expr") else "")
-        self.schedule_edit.setPlaceholderText(
-            "e.g. daily@02:00 (Task Scheduler integration coming soon - stored but not yet enforced)"
-        )
-        form.addRow("Schedule:", self.schedule_edit)
+        schedule_box = QGroupBox("Schedule")
+        schedule_layout = QVBoxLayout()
+
+        freq_row = QHBoxLayout()
+        freq_row.addWidget(QLabel("Frequency:"))
+        self.freq_combo = QComboBox()
+        # (label, kind) - kind matches task_scheduler's decompose/build "kind" values,
+        # except "none" which just means "no schedule".
+        self._freq_kinds = [
+            ("No schedule (run manually only)", "none"),
+            ("Daily", "daily"),
+            ("Weekly", "weekly"),
+            ("Hourly", "hourly"),
+            ("Every N hours", "every_hours"),
+            ("Every N minutes", "every_minutes"),
+            ("Once", "once"),
+        ]
+        for label, _kind in self._freq_kinds:
+            self.freq_combo.addItem(label)
+        self.freq_combo.currentIndexChanged.connect(self._on_frequency_changed)
+        freq_row.addWidget(self.freq_combo, 1)
+        schedule_layout.addLayout(freq_row)
+
+        self.freq_stack = QStackedWidget()
+
+        # Index 0: none - nothing to configure.
+        self.freq_stack.addWidget(QWidget())
+
+        # Index 1: daily - just a time.
+        daily_page = QWidget()
+        daily_layout = QHBoxLayout(daily_page)
+        daily_layout.setContentsMargins(0, 0, 0, 0)
+        daily_layout.addWidget(QLabel("At:"))
+        self.daily_time_edit = QTimeEdit(QTime(2, 0))
+        self.daily_time_edit.setDisplayFormat("HH:mm")
+        daily_layout.addWidget(self.daily_time_edit)
+        daily_layout.addStretch()
+        self.freq_stack.addWidget(daily_page)
+
+        # Index 2: weekly - day checkboxes + time.
+        weekly_page = QWidget()
+        weekly_layout = QVBoxLayout(weekly_page)
+        weekly_layout.setContentsMargins(0, 0, 0, 0)
+        days_row = QHBoxLayout()
+        days_row.addWidget(QLabel("On:"))
+        self.day_checks = {}
+        for day in ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]:
+            chk = QCheckBox(day.capitalize())
+            self.day_checks[day] = chk
+            days_row.addWidget(chk)
+        days_row.addStretch()
+        weekly_layout.addLayout(days_row)
+        weekly_time_row = QHBoxLayout()
+        weekly_time_row.addWidget(QLabel("At:"))
+        self.weekly_time_edit = QTimeEdit(QTime(3, 0))
+        self.weekly_time_edit.setDisplayFormat("HH:mm")
+        weekly_time_row.addWidget(self.weekly_time_edit)
+        weekly_time_row.addStretch()
+        weekly_layout.addLayout(weekly_time_row)
+        self.freq_stack.addWidget(weekly_page)
+
+        # Index 3: hourly - nothing to configure.
+        self.freq_stack.addWidget(QWidget())
+
+        # Index 4: every N hours.
+        every_h_page = QWidget()
+        every_h_layout = QHBoxLayout(every_h_page)
+        every_h_layout.setContentsMargins(0, 0, 0, 0)
+        every_h_layout.addWidget(QLabel("Every"))
+        self.every_hours_spin = QSpinBox()
+        self.every_hours_spin.setRange(1, 168)
+        self.every_hours_spin.setValue(6)
+        every_h_layout.addWidget(self.every_hours_spin)
+        every_h_layout.addWidget(QLabel("hour(s)"))
+        every_h_layout.addStretch()
+        self.freq_stack.addWidget(every_h_page)
+
+        # Index 5: every N minutes.
+        every_m_page = QWidget()
+        every_m_layout = QHBoxLayout(every_m_page)
+        every_m_layout.setContentsMargins(0, 0, 0, 0)
+        every_m_layout.addWidget(QLabel("Every"))
+        self.every_minutes_spin = QSpinBox()
+        self.every_minutes_spin.setRange(1, 1440)
+        self.every_minutes_spin.setValue(15)
+        every_m_layout.addWidget(self.every_minutes_spin)
+        every_m_layout.addWidget(QLabel("minute(s)"))
+        every_m_layout.addStretch()
+        self.freq_stack.addWidget(every_m_page)
+
+        # Index 6: once - date + time.
+        once_page = QWidget()
+        once_layout = QHBoxLayout(once_page)
+        once_layout.setContentsMargins(0, 0, 0, 0)
+        once_layout.addWidget(QLabel("At:"))
+        self.once_datetime_edit = QDateTimeEdit(QDateTime(QDate.currentDate().addDays(1), QTime(10, 0)))
+        self.once_datetime_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.once_datetime_edit.setCalendarPopup(True)
+        once_layout.addWidget(self.once_datetime_edit)
+        once_layout.addStretch()
+        self.freq_stack.addWidget(once_page)
+
+        schedule_layout.addWidget(self.freq_stack)
+        schedule_box.setLayout(schedule_layout)
+        form.addRow(schedule_box)
+
+        self._load_schedule_into_ui(job["schedule_expr"] if job else None)
 
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 128)
@@ -374,12 +479,77 @@ class JobEditorDialog(QDialog):
         if path:
             edit.setText(QDir.toNativeSeparators(path))
 
+    def _on_frequency_changed(self, index: int) -> None:
+        self.freq_stack.setCurrentIndex(index)
+
+    def _load_schedule_into_ui(self, schedule_expr: Optional[str]) -> None:
+        """Populates the Frequency dropdown + relevant page from an existing
+        job's schedule_expr (e.g. when opening the edit dialog)."""
+        kind = "none"
+        info: dict = {}
+        if schedule_expr:
+            try:
+                info = task_scheduler.decompose_schedule_expr(schedule_expr)
+                kind = info["kind"]
+            except task_scheduler.ScheduleParseError:
+                kind = "none"  # unrecognized/legacy expression - fall back to "no schedule" rather than crash
+
+        index = next((i for i, (_label, k) in enumerate(self._freq_kinds) if k == kind), 0)
+        self.freq_combo.setCurrentIndex(index)
+        self.freq_stack.setCurrentIndex(index)
+
+        if kind == "daily":
+            self.daily_time_edit.setTime(QTime(info["hour"], info["minute"]))
+        elif kind == "weekly":
+            for day, chk in self.day_checks.items():
+                chk.setChecked(day in info["days"])
+            self.weekly_time_edit.setTime(QTime(info["hour"], info["minute"]))
+        elif kind == "every_hours":
+            self.every_hours_spin.setValue(info["n"])
+        elif kind == "every_minutes":
+            self.every_minutes_spin.setValue(info["n"])
+        elif kind == "once":
+            y, m, d = (int(part) for part in info["date"].split("-"))
+            self.once_datetime_edit.setDateTime(QDateTime(QDate(y, m, d), QTime(info["hour"], info["minute"])))
+
+    def _build_schedule_expr(self) -> Optional[str]:
+        """Builds the canonical schedule_expr string from the current widget
+        state, or None for 'no schedule'. Raises ScheduleParseError if the
+        current selection is incomplete (e.g. weekly with no days checked)."""
+        kind = self._freq_kinds[self.freq_combo.currentIndex()][1]
+        if kind == "none":
+            return None
+        if kind == "daily":
+            t = self.daily_time_edit.time()
+            return task_scheduler.build_schedule_expr("daily", hour=t.hour(), minute=t.minute())
+        if kind == "weekly":
+            days = [day for day, chk in self.day_checks.items() if chk.isChecked()]
+            t = self.weekly_time_edit.time()
+            return task_scheduler.build_schedule_expr("weekly", days=days, hour=t.hour(), minute=t.minute())
+        if kind == "hourly":
+            return task_scheduler.build_schedule_expr("hourly")
+        if kind == "every_hours":
+            return task_scheduler.build_schedule_expr("every_hours", n=self.every_hours_spin.value())
+        if kind == "every_minutes":
+            return task_scheduler.build_schedule_expr("every_minutes", n=self.every_minutes_spin.value())
+        if kind == "once":
+            dt = self.once_datetime_edit.dateTime()
+            return task_scheduler.build_schedule_expr(
+                "once", date=dt.date().toString("yyyy-MM-dd"), hour=dt.time().hour(), minute=dt.time().minute()
+            )
+        return None
+
     def _on_accept(self) -> None:
         if not self.name_edit.text().strip():
             QMessageBox.warning(self, "Job Queue", "Please provide a job name.")
             return
         if not self.source_edit.text().strip() or not self.dest_edit.text().strip():
             QMessageBox.warning(self, "Job Queue", "Please provide both a source and destination path.")
+            return
+        try:
+            self._pending_schedule_expr = self._build_schedule_expr()
+        except task_scheduler.ScheduleParseError as e:
+            QMessageBox.warning(self, "Job Queue", str(e))
             return
         self.accept()
 
@@ -389,7 +559,7 @@ class JobEditorDialog(QDialog):
             "source": self.source_edit.text().strip(),
             "dest": self.dest_edit.text().strip(),
             "mode": "mirror" if self.mode_mirror_radio.isChecked() else "copy",
-            "schedule_expr": self.schedule_edit.text().strip() or None,
+            "schedule_expr": self._pending_schedule_expr,
             "threads": self.threads_spin.value(),
             "retries": self.retries_spin.value(),
             "auto_verify_acl": self.auto_verify_chk.isChecked(),
@@ -708,10 +878,12 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
 
         note = QLabel(
-            "Job definitions are stored locally (SQLite) and can be run on demand with "
-            "\u201cRun Now\u201d. Actually running them unattended on a schedule requires the "
-            "Windows Task Scheduler integration layer, which isn't built yet - the "
-            "Schedule field is stored but not yet enforced."
+            "Job definitions are stored locally (SQLite). Enabled jobs with a Schedule are "
+            "registered as real Windows Task Scheduler tasks (under \\TFSync\\) that invoke "
+            "run_scheduled_job.exe unattended - you don't need the GUI open for them to run. "
+            "Current limitation: registered tasks run under your current Windows account using "
+            "an interactive-only token, so they fire while you're logged on, but not across a "
+            "full logoff or a reboot with nobody logged in."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #999; font-style: italic;")
@@ -748,6 +920,7 @@ class MainWindow(QMainWindow):
         self.jobs_table.setEditTriggers(QTableView.NoEditTriggers)
         self.jobs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.jobs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.jobs_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Stretch)
         layout.addWidget(self.jobs_table, 1)
 
         controls = QHBoxLayout()
@@ -755,6 +928,9 @@ class MainWindow(QMainWindow):
         new_btn.clicked.connect(self.on_new_job)
         edit_btn = QPushButton("Edit Job...")
         edit_btn.clicked.connect(self.on_edit_job)
+        clone_btn = QPushButton("Clone Job...")
+        clone_btn.setToolTip("Open a New Job dialog pre-filled with this job's settings")
+        clone_btn.clicked.connect(self.on_clone_job)
         delete_btn = QPushButton("Delete Job")
         delete_btn.clicked.connect(self.on_delete_job)
         run_btn = QPushButton("Run Now")
@@ -762,13 +938,21 @@ class MainWindow(QMainWindow):
         compare_btn = QPushButton("Compare...")
         compare_btn.setToolTip("Open the Compare ACLs tab with this job's source/dest/threads filled in")
         compare_btn.clicked.connect(self.on_compare_job)
+        sync_schedules_btn = QPushButton("Sync Schedules Now")
+        sync_schedules_btn.setToolTip(
+            "Reconciles Task Scheduler with the jobs database: registers/updates enabled "
+            "scheduled jobs, removes tasks for disabled/unscheduled jobs, and cleans up orphans."
+        )
+        sync_schedules_btn.clicked.connect(self.on_sync_schedules_now)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh_jobs_table)
         controls.addWidget(new_btn)
         controls.addWidget(edit_btn)
+        controls.addWidget(clone_btn)
         controls.addWidget(delete_btn)
         controls.addWidget(run_btn)
         controls.addWidget(compare_btn)
+        controls.addWidget(sync_schedules_btn)
         controls.addStretch()
         controls.addWidget(refresh_btn)
         layout.addLayout(controls)
@@ -800,6 +984,7 @@ class MainWindow(QMainWindow):
     def refresh_jobs_table(self) -> None:
         self.jobs_model.removeRows(0, self.jobs_model.rowCount())
         for job in store.list_jobs():
+            next_run = self._next_run_display(job)
             row = [
                 QStandardItem(job["name"]),
                 QStandardItem(job["source"]),
@@ -810,10 +995,21 @@ class MainWindow(QMainWindow):
                 QStandardItem("Yes" if job["auto_verify_acl"] else "No"),
                 QStandardItem("Yes" if job["enabled"] else "No"),
                 QStandardItem(job["last_run_status"] or "Never run"),
+                QStandardItem(next_run),
             ]
             row[0].setData(job["job_id"], Qt.UserRole)
             self.jobs_model.appendRow(row)
         self._refresh_compare_job_combo()
+
+    def _next_run_display(self, job: dict) -> str:
+        if os.name != "nt":
+            return "N/A (Windows only)"
+        if not (job["enabled"] and job["schedule_expr"]):
+            return "Not scheduled"
+        info = task_scheduler.query_task(job["job_id"])
+        if not info:
+            return "Not registered - use \u201cSync Schedules Now\u201d"
+        return info.get("Next Run Time", "Unknown")
 
     def _refresh_compare_job_combo(self) -> None:
         if not hasattr(self, "compare_job_combo"):
@@ -849,8 +1045,9 @@ class MainWindow(QMainWindow):
         dialog = JobEditorDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             values = dialog.values()
-            store.create_job(**values)
+            job_id = store.create_job(**values)
             self.refresh_jobs_table()
+            self._sync_job_schedule(job_id)
 
     def on_edit_job(self) -> None:
         job_id = self._selected_job_id()
@@ -862,6 +1059,47 @@ class MainWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             store.update_job(job_id, **dialog.values())
             self.refresh_jobs_table()
+            self._sync_job_schedule(job_id)
+
+    def on_clone_job(self) -> None:
+        job_id = self._selected_job_id()
+        if not job_id:
+            QMessageBox.information(self, APP_TITLE, "Select a job to clone first.")
+            return
+        source_job = store.get_job(job_id)
+        if not source_job:
+            return
+        clone_seed = dict(source_job)
+        clone_seed["name"] = f"{source_job['name']} (Copy)"
+        dialog = JobEditorDialog(self, job=clone_seed, window_title="Clone Job")
+        if dialog.exec_() == QDialog.Accepted:
+            new_job_id = store.create_job(**dialog.values())
+            self.refresh_jobs_table()
+            self._sync_job_schedule(new_job_id)
+
+    def _sync_job_schedule(self, job_id: str) -> None:
+        """
+        Registers/updates or removes the job's Windows scheduled task so
+        Task Scheduler matches the job definition just saved. A no-op on
+        non-Windows (there's nothing to register against).
+        """
+        if os.name != "nt":
+            return
+        job = store.get_job(job_id)
+        if not job:
+            return
+        try:
+            if job["enabled"] and job["schedule_expr"]:
+                task_scheduler.register_task(job)
+            else:
+                task_scheduler.delete_task(job_id)
+        except (task_scheduler.TaskSchedulerError, task_scheduler.ScheduleParseError) as e:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                f"Job saved, but the scheduled task could not be updated:\n{e}\n\n"
+                f"You can retry from \u201cSync Schedules Now\u201d."
+            )
+        self.refresh_jobs_table()
 
     def on_delete_job(self) -> None:
         job_id = self._selected_job_id()
@@ -876,12 +1114,17 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self, APP_TITLE,
             f"Decommission \u201c{job['name']}\u201d?\n\n"
-            f"This deletes the job definition and all {history_count} of its run history "
-            f"record(s). This cannot be undone.\n\n"
+            f"This removes its scheduled task (if any), deletes the job definition, and "
+            f"deletes all {history_count} of its run history record(s). This cannot be undone.\n\n"
             f"(Lifetime usage totals for licensing are unaffected either way.)",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
+            if os.name == "nt":
+                try:
+                    task_scheduler.delete_task(job_id)
+                except task_scheduler.TaskSchedulerError:
+                    pass  # best-effort - the job/history deletion below still proceeds
             store.delete_job(job_id)
             self.refresh_jobs_table()
             self.refresh_history_table()
@@ -898,6 +1141,24 @@ class MainWindow(QMainWindow):
         self.dest_edit.setText(job["dest"])
         self.threads_spin.setValue(job["threads"])
         self.tabs.setCurrentIndex(1)
+
+    def on_sync_schedules_now(self) -> None:
+        if os.name != "nt":
+            QMessageBox.information(self, APP_TITLE, "Task Scheduler integration requires Windows.")
+            return
+        try:
+            summary = task_scheduler.reconcile_all(store.list_jobs())
+        except task_scheduler.TaskSchedulerError as e:
+            QMessageBox.critical(self, APP_TITLE, f"Could not sync schedules:\n{e}")
+            return
+        self.refresh_jobs_table()
+        msg = (f"Registered/updated: {summary['registered']}\n"
+               f"Removed (disabled/unscheduled/orphaned): {summary['removed']}")
+        if summary["errors"]:
+            msg += "\n\nErrors:\n" + "\n".join(summary["errors"])
+            QMessageBox.warning(self, APP_TITLE, msg)
+        else:
+            QMessageBox.information(self, APP_TITLE, msg)
 
     def on_run_job_now(self) -> None:
         job_id = self._selected_job_id()

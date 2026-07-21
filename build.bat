@@ -78,11 +78,29 @@ if errorlevel 1 (
 )
 
 echo.
+echo === Building scheduled job runner: run_scheduled_job.exe ===
+REM Invoked by Task Scheduler (see task_scheduler.py) - not meant to be run
+REM by hand, so no --console suppression concerns here either way.
+pyinstaller --onefile --console --name run_scheduled_job ^
+    --hidden-import=win32timezone ^
+    --hidden-import=win32security ^
+    --hidden-import=win32process ^
+    --hidden-import=ntsecuritycon ^
+    run_scheduled_job.py
+
+if errorlevel 1 (
+    echo.
+    echo *** run_scheduled_job build FAILED - see errors above ***
+    goto :end
+)
+
+echo.
 echo === Done ===
 echo   CLI exe:          dist\compare_acls.exe
 echo   GUI exe:          dist\tfsync_gui.exe
 echo   Sync exe:         dist\sync_shares.exe
 echo   Mask decoder exe: dist\decode_mask.exe
+echo   Scheduled runner: dist\run_scheduled_job.exe
 
 set ISCC="C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if exist %ISCC% (

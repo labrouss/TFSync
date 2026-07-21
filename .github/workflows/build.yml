@@ -5,7 +5,7 @@ name: Build Executables
 # Builds:
 #   - Windows: full tool as raw executables AND as a proper installer
 #     (compare_acls.exe, tfsync_gui.exe, sync_shares.exe,
-#     decode_mask.exe, TFSync_Setup.exe)
+#     run_scheduled_job.exe, decode_mask.exe, TFSync_Setup.exe)
 #   - Linux / macOS (x86_64 + arm64): decode_mask only
 #
 # Why not the full tool on Linux/macOS? compare_acls.py and tfsync_gui.py
@@ -73,6 +73,15 @@ jobs:
           --hidden-import=ntsecuritycon
           sync_shares.py
 
+      - name: Build scheduled job runner (run_scheduled_job.exe)
+        run: >
+          pyinstaller --onefile --console --name run_scheduled_job
+          --hidden-import=win32timezone
+          --hidden-import=win32security
+          --hidden-import=win32process
+          --hidden-import=ntsecuritycon
+          run_scheduled_job.py
+
       - name: Determine version from tag
         id: version
         shell: pwsh
@@ -101,6 +110,7 @@ jobs:
             dist/tfsync_gui.exe
             dist/sync_shares.exe
             dist/decode_mask.exe
+            dist/run_scheduled_job.exe
 
       - name: Upload installer
         uses: actions/upload-artifact@v4

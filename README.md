@@ -13,39 +13,80 @@ standalone helper for decoding raw permission masks.
 
 ## Roadmap
 
-A local job queue and run history (both SQLite-backed) now exist in the GUI
+A local job queue and run history (both SQLite-backed) exist in the GUI
 (tabs 3 and 4 below), along with licensing scaffolding (a stubbed
 always-unlimited `LicenseManager`/`UsageTracker`, free tier capped at
-100GB lifetime). **Not yet built**: the Windows Task Scheduler integration
-that would actually register jobs to run unattended - job definitions store
-a schedule expression today, but nothing acts on it yet, so jobs only run
-when you click "Run Now".
+100GB lifetime), **and** Windows Task Scheduler integration - enabled jobs
+with a schedule are registered as real scheduled tasks and run unattended
+via `run_scheduled_job.exe` (see the Job Queue section below for the
+current logged-on-only limitation). Nothing major left from the original
+design brief; remaining ideas are refinements (e.g. a credential-prompt
+flow to support running fully logged-off/rebooted, not just logged-on).
 
 ## Job Queue (GUI tab 3)
 
 Define reusable sync jobs (name, source, dest, mode, thread/retry settings,
-optional auto-chained ACL verification, a schedule expression field that's
-stored but not yet enforced) and run them on demand with **Run Now**. A few
-notes on how this behaves today:
+optional auto-chained ACL verification, and an optional **Schedule**) and
+run them on demand with **Run Now** - or let them run unattended via
+Windows Task Scheduler.
+
+**Schedule** (set via a Frequency dropdown in the job editor, not raw text):
+Daily and Weekly show a time picker (Weekly also shows day checkboxes);
+Hourly, Every N hours/minutes, and Once are also available for less
+common cases. Internally this still maps to a compact `schedule_expr`
+string (see `task_scheduler.py`) - e.g. `daily@02:00` or
+`weekly:MON,WED,FRI@03:30` - so existing jobs created before this UI
+existed still load correctly (the dropdown/checkboxes/time picker just
+populate themselves from whatever's stored). Pick "No schedule" for a job
+you only ever run manually.
+
+**How the Task Scheduler integration works** (`task_scheduler.py` +
+`run_scheduled_job.py`):
+- Saving an enabled job with a schedule registers (or updates) a real
+  Windows scheduled task under `\TFSync\<job_id>`, whose action is
+  `run_scheduled_job.exe --job-id <job_id>`. That runner reads the job
+  fresh from the database, runs the sync, logs it to run history, chains
+  the ACL comparison if configured, and applies retention - the same
+  logic "Run Now" uses, just without the GUI.
+- Disabling a job, clearing its schedule, or deleting it removes the
+  corresponding scheduled task.
+- **Sync Schedules Now** reconciles the database against what's actually
+  registered: it (re)creates tasks for every enabled+scheduled job,
+  removes tasks for disabled/unscheduled jobs, and cleans up any orphaned
+  `\TFSync\*` task whose job no longer exists - useful after manual
+  changes in Task Scheduler itself, or after moving the install.
+- The **Next Run** column reflects Task Scheduler's own "Next Run Time"
+  for that task (via `schtasks /Query`), or explains why there isn't one
+  (not scheduled, not yet registered, or "N/A" off Windows).
+- **Current limitation**: registered tasks run under your own Windows
+  account using an interactive-only token (`schtasks /RU <you> /IT`) - no
+  password is requested or stored. That means a job fires while you're
+  logged on, but **not** across a full logoff or a reboot with nobody
+  logged in. Supporting that would mean prompting for and passing a
+  Windows account password to `schtasks` (`/RU` + `/RP`), which this first
+  cut deliberately avoids to sidestep handling a plaintext credential.
+
+A few other notes on how the queue behaves:
 
 - **Max concurrent jobs** (default 2) is an actual cap - "Run Now" is
   blocked once that many jobs are running at once, to avoid an unbounded
-  pile of simultaneous robocopy processes.
+  pile of simultaneous robocopy processes. (This caps concurrent manual/
+  Run Now executions in the GUI; scheduled runs via Task Scheduler run in
+  their own separate process outside this cap today.)
 - **Thread warning threshold** (default 64) is a soft warning, not a cap -
   the "Active jobs" banner turns orange and explains why, but won't stop
   you from proceeding, since the queue length itself is intentionally
   unbounded (per the design brief).
-- Jobs with **auto-verify ACL** enabled kick off a background ACL
-  comparison after a successful (non-dry-run, non-cancelled) run and
-  write its report to `job_reports/`; the summary counts get attached to
-  that run's history entry once the comparison finishes.
-- **Deleting a job decommissions it**: it unregisters any scheduled task
-  (a no-op today - there's nothing to unregister until the Task Scheduler
-  integration exists, but the hook is already wired in) and **deletes all
-  of that job's run history** from the database. The confirmation dialog
-  tells you how many history rows will go with it. Lifetime usage totals
-  used for the licensing quota are kept regardless, since those bytes were
-  actually transferred whether or not the job/its logs still exist.
+- Jobs with **auto-verify ACL** enabled kick off an ACL comparison after a
+  successful (non-dry-run, non-cancelled) run and write its report to
+  `job_reports/`; the summary counts get attached to that run's history
+  entry once the comparison finishes.
+- **Deleting a job decommissions it**: it removes its scheduled task (if
+  any), deletes the job definition, and **deletes all of that job's run
+  history** from the database. The confirmation dialog tells you how many
+  history rows will go with it. Lifetime usage totals used for the
+  licensing quota are kept regardless, since those bytes were actually
+  transferred whether or not the job/its logs still exist.
 
 ## Run History (GUI tab 4)
 
@@ -83,6 +124,8 @@ That means:
 |---|---|---|
 | `compare_acls.py` (CLI) | ✅ Full functionality | ❌ Exits with a clear error |
 | `tfsync_gui.py` (GUI) | ✅ Full functionality | ❌ Shows a clear error dialog |
+| `run_scheduled_job.py` (Task Scheduler runner) | ✅ Full functionality | ❌ Exits with a clear error |
+| `task_scheduler.py` (scheduling integration) | ✅ Registers/queries real tasks | ⚠️ Schedule *parsing/validation* works everywhere; actually registering a task requires `schtasks.exe` (Windows only) |
 | `decode_mask.py` (mask decoder) | ✅ | ✅ Pure Python, works everywhere |
 
 The GitHub Actions workflow reflects this: it builds full Windows executables
@@ -132,11 +175,13 @@ only ever print "this must run on Windows."
 ```
 acl_compare_core.py                    Shared comparison engine (used by CLI and GUI)
 compare_acls.py                        Command-line interface (compare)
-tfsync_gui.py                    PyQt5 graphical interface (sync + compare)
+tfsync_gui.py                          PyQt5 graphical interface (sync + compare + job queue + history)
 robocopy_sync.py                       Shared robocopy wrapper engine (used by CLI and GUI)
 sync_shares.py                         Command-line interface (sync)
 decode_mask.py                         Standalone access-mask decoder (cross-platform)
 tfsync_store.py                        SQLite job/run-history store + LicenseManager/UsageTracker stubs (cross-platform, no Windows deps)
+task_scheduler.py                      Schedule expression parsing (cross-platform) + schtasks.exe wrapper (Windows only)
+run_scheduled_job.py                   Headless entry point Task Scheduler invokes to actually run one job
 requirements.txt                       Python dependencies
 build.bat                              Local Windows build script (PyInstaller + installer)
 installer/compare_acls_installer.iss   Inno Setup script for the Windows installer
@@ -211,10 +256,12 @@ pip install -r requirements.txt
 pip install pyinstaller
 build.bat
 ```
-Produces `dist\compare_acls.exe`, `dist\tfsync_gui.exe`, and
-`dist\decode_mask.exe`. The GUI build defaults to `--console` so startup
-errors are visible on first run; switch to `--windowed` in `build.bat` once
-you've confirmed it runs cleanly.
+Produces `dist\compare_acls.exe`, `dist\tfsync_gui.exe`, `dist\sync_shares.exe`,
+`dist\run_scheduled_job.exe`, and `dist\decode_mask.exe`. The GUI build
+defaults to `--console` so startup errors are visible on first run; switch
+to `--windowed` in `build.bat` once you've confirmed it runs cleanly.
+`run_scheduled_job.exe` is invoked by Task Scheduler, not meant to be run
+by hand - see the Job Queue section above.
 
 If [Inno Setup](https://jrsoftware.org/isdl.php) 6 is installed at its
 default path, `build.bat` also builds a proper installer at
@@ -229,8 +276,9 @@ note - the raw `.exe` files still work fine on their own.
 
 Push a tag matching `v*` (e.g. `v1.0.0`), or trigger the workflow manually
 from the Actions tab. It builds:
-- **Windows**: `compare_acls.exe`, `tfsync_gui.exe`, `decode_mask.exe`,
-  and `TFSync_Setup.exe` (the installer, versioned from the tag)
+- **Windows**: `compare_acls.exe`, `tfsync_gui.exe`, `sync_shares.exe`,
+  `run_scheduled_job.exe`, `decode_mask.exe`, and `TFSync_Setup.exe` (the
+  installer, versioned from the tag)
 - **Linux (x86_64)**, **macOS (x86_64)**, **macOS (arm64)**: `decode_mask`
   only, for the reasons explained above
 
@@ -255,6 +303,10 @@ RelativePath, ItemType, DifferenceType, Detail, SourceValue, DestValue
 
 ## Known limitations
 
+- Scheduled tasks run under your current Windows account with an
+  interactive-only token (`/RU <you> /IT`, no password stored) - they
+  fire while you're logged on, but **not** across a full logoff or a
+  reboot with nobody logged in. See the Job Queue section above.
 - Same-location detection (`paths_are_same`) is a normalized string
   comparison; it won't catch two different paths that happen to resolve to
   the same underlying share (e.g. a mapped drive letter vs. its UNC path, or

@@ -1,0 +1,21 @@
+
+-------------------------------------------------------------------------------
+   ROBOCOPY     ::     Robust File Copy for Windows                              
+-------------------------------------------------------------------------------
+
+  Started : Tuesday, July 21, 2026 10:35:57 PM
+   Source = \\192.168.31.8\ITOT\
+     Dest = \\192.168.31.28\ITOT\
+
+    Files : *.*
+	    
+  Options : *.* /TEE /S /E /DCOPY:DAT /COPY:DATSO /NP /XJ /MT:32 /R:3 /W:5 
+
+------------------------------------------------------------------------------
+
+NOTE : Security may not be copied - Source might not support persistent ACLs.
+
+NOTE : Security may not be copied - Destination might not support persistent ACLs.
+
+2026/07/21 22:38:04 ERROR 53 (0x00000035) Accessing Source Directory \\192.168.31.8\ITOT\
+The network path was not found.
