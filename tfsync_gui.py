@@ -588,6 +588,7 @@ class MainWindow(QMainWindow):
         self._sync_dest = ""
         self._sync_mode = "copy"
         self._sync_start_time = None
+        self._sync_log_path = None
         self._last_manual_run_id = None
         self._pending_acl_chain_run_id = None
         self._active_job_runs: dict = {}   # job_id -> {"worker": SyncWorker, "start_time": datetime, "run_id": str or None}
@@ -1237,7 +1238,8 @@ class MainWindow(QMainWindow):
         log_dir = os.path.join(os.getcwd(), "job_logs")
         os.makedirs(log_dir, exist_ok=True)
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
-        log_path = os.path.join(log_dir, f"{safe_name}_{uuid.uuid4().hex[:8]}.log")
+        run_id = uuid.uuid4().hex
+        log_path = os.path.join(log_dir, f"{safe_name}_{run_id[:8]}.log")
 
         worker = SyncWorker(
             job["source"], job["dest"], mirror, False,
@@ -1248,6 +1250,7 @@ class MainWindow(QMainWindow):
 
         self._active_job_runs[job_id] = {
             "worker": worker, "start_time": datetime.now(timezone.utc), "threads": job["threads"],
+            "run_id": run_id, "log_path": log_path,
         }
         self._update_active_jobs_label()
         self.refresh_jobs_table()
@@ -1266,6 +1269,7 @@ class MainWindow(QMainWindow):
         run_id = store.record_run(
             result, job["source"], job["dest"], job["mode"], dry_run=False,
             start_time=entry["start_time"], end_time=end_time, job_id=job_id,
+            run_id=entry["run_id"], log_path=entry["log_path"],
         )
         self.refresh_jobs_table()
         self.refresh_history_table()
@@ -1298,7 +1302,7 @@ class MainWindow(QMainWindow):
         def on_done(counts: dict) -> None:
             csv_file.close()
             acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
-            store.update_run_acl_summary(run_id, acl_summary)
+            store.update_run_acl_summary(run_id, acl_summary, report_path=report_path)
             self.refresh_history_table()
             self._job_acl_workers[:] = [w for w in self._job_acl_workers if w is not worker]
 
@@ -1347,6 +1351,14 @@ class MainWindow(QMainWindow):
         self.history_job_combo.currentIndexChanged.connect(self.refresh_history_table)
         filter_row.addWidget(self.history_job_combo)
         filter_row.addStretch()
+        view_log_btn = QPushButton("View Log")
+        view_log_btn.setToolTip("Open the selected run's robocopy log file with your system's default viewer")
+        view_log_btn.clicked.connect(self.on_view_selected_log)
+        filter_row.addWidget(view_log_btn)
+        view_acl_btn = QPushButton("View ACL Report")
+        view_acl_btn.setToolTip("Open the selected run's chained ACL comparison CSV, if it has one")
+        view_acl_btn.clicked.connect(self.on_view_selected_acl_report)
+        filter_row.addWidget(view_acl_btn)
         delete_selected_btn = QPushButton("Delete Selected")
         delete_selected_btn.setToolTip("Delete the selected run(s) from history (Ctrl/Shift-click to select multiple)")
         delete_selected_btn.clicked.connect(self.on_delete_selected_history)
@@ -1601,6 +1613,7 @@ class MainWindow(QMainWindow):
         self._sync_dest = dest
         self._sync_mode = "mirror" if mirror else "copy"
         self._sync_start_time = datetime.now(timezone.utc)
+        self._sync_log_path = log_path
 
         self.sync_log_view.clear()
         mode_label = "MIRROR" if mirror else "copy-only"
@@ -1656,6 +1669,7 @@ class MainWindow(QMainWindow):
         self._last_manual_run_id = store.record_run(
             result, self._sync_source, self._sync_dest, self._sync_mode, dry_run=dry_run,
             start_time=self._sync_start_time, end_time=datetime.now(timezone.utc), job_id=None,
+            log_path=self._sync_log_path,
         )
         self.refresh_history_table()
 
@@ -1808,7 +1822,7 @@ class MainWindow(QMainWindow):
 
         if self._pending_acl_chain_run_id:
             acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
-            store.update_run_acl_summary(self._pending_acl_chain_run_id, acl_summary)
+            store.update_run_acl_summary(self._pending_acl_chain_run_id, acl_summary, report_path=self.last_output_path)
             self._pending_acl_chain_run_id = None
             self.refresh_history_table()
 
@@ -1869,25 +1883,64 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_TITLE, f"Could not open folder:\n{e}")
 
     def view_report_csv(self) -> None:
-        if not self.last_output_path:
+        self._open_with_system_default(self.last_output_path, "The report")
+
+    def _open_with_system_default(self, path: Optional[str], what: str = "The file") -> None:
+        """Opens a file with the system's default application for its type
+        (e.g. Excel for .csv). Shared by the Compare tab's View CSV button
+        and the Run History tab's View Log / View ACL Report buttons."""
+        if not path:
+            QMessageBox.information(self, APP_TITLE, f"{what} has no recorded file path.")
             return
-        path = os.path.abspath(self.last_output_path)
-        if not os.path.isfile(path):
-            QMessageBox.warning(self, APP_TITLE, f"Report file not found:\n{path}")
+        abspath = os.path.abspath(path)
+        if not os.path.isfile(abspath):
+            QMessageBox.warning(self, APP_TITLE, f"{what} was not found on disk:\n{abspath}")
             return
         try:
             if os.name == "nt":
-                os.startfile(path)
+                os.startfile(abspath)
             elif sys.platform == "darwin":
-                subprocess.run(["open", path], check=True)
+                subprocess.run(["open", abspath], check=True)
             else:
-                subprocess.run(["xdg-open", path], check=True)
+                subprocess.run(["xdg-open", abspath], check=True)
         except Exception as e:
             QMessageBox.warning(
                 self, APP_TITLE,
-                f"Could not open the report with your system's default CSV viewer:\n{e}\n\n"
-                f"File location:\n{path}"
+                f"Could not open this with your system's default application:\n{e}\n\n"
+                f"File location:\n{abspath}"
             )
+
+    def on_view_selected_log(self) -> None:
+        run_id = self._selected_history_run_id()
+        if not run_id:
+            QMessageBox.information(self, APP_TITLE, "Select a run in the table first.")
+            return
+        run = store.get_run(run_id)
+        if not run:
+            return
+        self._open_with_system_default(run.get("log_path"), "This run's robocopy log")
+
+    def on_view_selected_acl_report(self) -> None:
+        run_id = self._selected_history_run_id()
+        if not run_id:
+            QMessageBox.information(self, APP_TITLE, "Select a run in the table first.")
+            return
+        run = store.get_run(run_id)
+        if not run:
+            return
+        if not run.get("acl_chained"):
+            QMessageBox.information(self, APP_TITLE, "This run didn't have an ACL comparison chained to it.")
+            return
+        self._open_with_system_default(run.get("acl_report_path"), "This run's ACL comparison report")
+
+    def _selected_history_run_id(self) -> Optional[str]:
+        selection_model = self.history_table.selectionModel()
+        if not selection_model:
+            return None
+        rows = selection_model.selectedRows()
+        if not rows:
+            return None
+        return self.history_model.item(rows[0].row(), 0).data(Qt.UserRole)
 
     def closeEvent(self, event) -> None:
         if self.worker and self.worker.isRunning():

@@ -97,6 +97,23 @@ bytes copied, derived MB/s and seconds-per-GB, exit code + description,
 and any chained ACL comparison summary. Filter by job (or "All runs") and
 hit Refresh to pull the latest. Failed runs are highlighted in red.
 
+**Viewing a run's log or ACL report**: every run (manual, "Run Now", or
+scheduled) writes its own robocopy log file - each run gets a unique log
+named after its own run ID (under `job_logs/` for Job Queue runs, or
+wherever you point "Log file" on the Sync tab for manual ones), so one
+run's log never overwrites another's. Select a row and use:
+- **View Log** - opens that run's robocopy log with your system's default
+  text viewer.
+- **View ACL Report** - opens that run's chained ACL comparison CSV, if
+  one was run (job auto-verify, or accepting the "run comparison now?"
+  prompt after a manual sync).
+
+Both tell you plainly if there's nothing to open (no log path recorded,
+the file's gone, or no ACL comparison was chained to that particular run).
+Runs recorded by an older build of TFSync, before this tracking existed,
+won't have a log/report path stored - there's nothing to recover for
+those, but every run going forward does.
+
 **Manual deletion**: alongside automatic retention (below), you can also
 remove history by hand:
 - **Delete Selected** - deletes just the row(s) you've selected in the

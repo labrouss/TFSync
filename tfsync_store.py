@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS run_history (
     seconds_per_gb    REAL,
     acl_chained       INTEGER NOT NULL DEFAULT 0,
     acl_summary_json  TEXT,                               -- {"missing":n,"extra":n,"owner_diff":n,...} if chained
+    acl_report_path   TEXT,                                -- path to the chained ACL comparison's CSV report, if any
+    log_path          TEXT,                                -- path to this run's robocopy log file, if one was written
     raw_summary_json  TEXT NOT NULL,                       -- full parsed robocopy summary, for auditing
     FOREIGN KEY (job_id) REFERENCES jobs (job_id)
 );
@@ -137,9 +139,21 @@ def _connect(db_path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
-    """Creates the database file and tables if they don't already exist."""
+    """Creates the database file and tables if they don't already exist,
+    and applies any lightweight column migrations for databases created
+    with an older schema version (CREATE TABLE IF NOT EXISTS alone won't
+    add new columns to a table that already exists)."""
     with _connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate_columns(conn)
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(run_history)").fetchall()}
+    if "acl_report_path" not in existing:
+        conn.execute("ALTER TABLE run_history ADD COLUMN acl_report_path TEXT")
+    if "log_path" not in existing:
+        conn.execute("ALTER TABLE run_history ADD COLUMN log_path TEXT")
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +270,8 @@ def record_run(
     end_time: datetime,
     job_id: Optional[str] = None,
     acl_summary: Optional[Dict[str, int]] = None,
+    run_id: Optional[str] = None,
+    log_path: Optional[str] = None,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> str:
     """
@@ -264,8 +280,12 @@ def record_run(
     track (job_id, wall-clock start/end, and an optional chained ACL
     comparison summary).
 
+    Pass run_id if the caller needs to know the ID before the robocopy log
+    file is written (e.g. to name the log file after the run_id so it can
+    be found again later) - otherwise one is generated automatically.
+
     Also appends to usage_ledger so UsageTracker can compute lifetime usage.
-    Returns the new run_id.
+    Returns the run_id (the one passed in, or the generated one).
     """
     summary = result.get("summary", {})
     duration = max((end_time - start_time).total_seconds(), 0.0)
@@ -295,7 +315,7 @@ def record_run(
     exit_code = int(result.get("exit_code", -1))
     is_fail = bool(result.get("cancelled")) or exit_code >= 8  # matches robocopy_sync.is_failure convention
 
-    run_id = _new_id()
+    run_id = run_id or _new_id()
     with _connect(db_path) as conn:
         conn.execute(
             """INSERT INTO run_history
@@ -304,8 +324,8 @@ def record_run(
                 dirs_copied, dirs_skipped, dirs_failed, dirs_extras,
                 files_copied, files_skipped, files_failed, files_extras,
                 bytes_copied, throughput_mb_s, throughput_files_s, seconds_per_gb,
-                acl_chained, acl_summary_json, raw_summary_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                acl_chained, acl_summary_json, log_path, raw_summary_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id, job_id, source, dest, mode, int(dry_run),
                 start_time.astimezone(timezone.utc).isoformat(timespec="seconds"),
@@ -315,7 +335,7 @@ def record_run(
                 files_copied, files_skipped, files_failed, files_extras,
                 bytes_copied, throughput_mb_s, throughput_files_s, seconds_per_gb,
                 int(acl_summary is not None), json.dumps(acl_summary) if acl_summary else None,
-                json.dumps(summary),
+                log_path, json.dumps(summary),
             ),
         )
         if job_id:
@@ -332,16 +352,28 @@ def record_run(
     return run_id
 
 
-def update_run_acl_summary(run_id: str, acl_summary: Dict[str, int], db_path: Path = DEFAULT_DB_PATH) -> None:
+def get_run(run_id: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM run_history WHERE run_id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_run_acl_summary(
+    run_id: str,
+    acl_summary: Dict[str, int],
+    report_path: Optional[str] = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
     """
-    Attaches a chained ACL-comparison summary to an already-recorded run
-    (used when the comparison is kicked off after the sync completes,
-    rather than known at record_run() time).
+    Attaches a chained ACL-comparison summary (and, if written, the path to
+    its CSV report) to an already-recorded run - used when the comparison
+    is kicked off after the sync completes, rather than known at
+    record_run() time.
     """
     with _connect(db_path) as conn:
         conn.execute(
-            "UPDATE run_history SET acl_chained = 1, acl_summary_json = ? WHERE run_id = ?",
-            (json.dumps(acl_summary), run_id),
+            "UPDATE run_history SET acl_chained = 1, acl_summary_json = ?, acl_report_path = ? WHERE run_id = ?",
+            (json.dumps(acl_summary), report_path, run_id),
         )
 
 

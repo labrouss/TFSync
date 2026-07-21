@@ -21,6 +21,7 @@ import argparse
 import csv
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 
 import acl_compare_core as core
@@ -57,10 +58,14 @@ def main() -> int:
         return 1
 
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
+    run_id = uuid.uuid4().hex
 
     log_dir = os.path.join(os.getcwd(), "job_logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"{safe_name}_{job['job_id'][:8]}.log")
+    # Named after this specific run, not the job, so every run keeps its own
+    # log instead of each new run silently overwriting the previous one
+    # (robocopy_sync writes logs with /LOG:, which truncates on each run).
+    log_path = os.path.join(log_dir, f"{safe_name}_{run_id[:8]}.log")
 
     start_time = datetime.now(timezone.utc)
     result = robocopy_sync.run_robocopy(
@@ -76,6 +81,7 @@ def main() -> int:
     run_id = store.record_run(
         result, job["source"], job["dest"], job["mode"], dry_run=False,
         start_time=start_time, end_time=end_time, job_id=job["job_id"],
+        run_id=run_id, log_path=log_path,
     )
     print(f"TFSync: run {run_id} recorded - {result['description']}")
 
@@ -101,7 +107,7 @@ def main() -> int:
                 row_cb=row_cb, should_cancel=lambda: False,
             )
         acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
-        store.update_run_acl_summary(run_id, acl_summary)
+        store.update_run_acl_summary(run_id, acl_summary, report_path=report_path)
         print(f"TFSync: chained ACL verification recorded - {acl_summary}")
 
     return 1 if is_fail else 0
