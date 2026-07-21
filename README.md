@@ -320,6 +320,11 @@ RelativePath, ItemType, DifferenceType, Detail, SourceValue, DestValue
 - `MATCH` - no differences found (only present with `--show-matches` /
   "Include matching items")
 
+In the GUI, once a comparison finishes, **View CSV** opens the report file
+directly in your system's default CSV application (e.g. Excel), and
+**Open Report Folder** opens the containing folder instead - both use the
+report path currently shown in "Output CSV".
+
 ## Known limitations
 
 - Scheduled tasks run under your current Windows account with an

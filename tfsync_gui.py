@@ -19,6 +19,7 @@ USAGE
 import csv
 import json
 import os
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -835,10 +836,15 @@ class MainWindow(QMainWindow):
         self.open_report_btn = QPushButton("Open Report Folder")
         self.open_report_btn.setEnabled(False)
         self.open_report_btn.clicked.connect(self.open_report_folder)
+        self.view_csv_btn = QPushButton("View CSV")
+        self.view_csv_btn.setToolTip("Open the report file itself with your system's default CSV viewer (e.g. Excel)")
+        self.view_csv_btn.setEnabled(False)
+        self.view_csv_btn.clicked.connect(self.view_report_csv)
 
         controls.addWidget(self.run_btn)
         controls.addWidget(self.cancel_btn)
         controls.addStretch()
+        controls.addWidget(self.view_csv_btn)
         controls.addWidget(self.open_report_btn)
         root_layout.addLayout(controls)
 
@@ -1723,6 +1729,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("Scanning source and destination trees...")
         self.progress_bar.setValue(0)
         self.open_report_btn.setEnabled(False)
+        self.view_csv_btn.setEnabled(False)
         self.last_output_path = output
 
         self._csv_file = open(output, "w", newline="", encoding="utf-8-sig")
@@ -1780,6 +1787,7 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.open_report_btn.setEnabled(True)
+        self.view_csv_btn.setEnabled(True)
 
         status = "CANCELLED" if counts.get("cancelled") else "COMPLETE"
         self.progress_bar.setFormat(f"{status} - {self.progress_bar.value()} items compared")
@@ -1859,6 +1867,27 @@ class MainWindow(QMainWindow):
             os.startfile(folder)
         except Exception as e:
             QMessageBox.warning(self, APP_TITLE, f"Could not open folder:\n{e}")
+
+    def view_report_csv(self) -> None:
+        if not self.last_output_path:
+            return
+        path = os.path.abspath(self.last_output_path)
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, APP_TITLE, f"Report file not found:\n{path}")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path], check=True)
+            else:
+                subprocess.run(["xdg-open", path], check=True)
+        except Exception as e:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                f"Could not open the report with your system's default CSV viewer:\n{e}\n\n"
+                f"File location:\n{path}"
+            )
 
     def closeEvent(self, event) -> None:
         if self.worker and self.worker.isRunning():
