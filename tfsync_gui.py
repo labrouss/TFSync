@@ -585,6 +585,13 @@ class MainWindow(QMainWindow):
         input_box = QGroupBox("Comparison Options")
         form = QFormLayout()
 
+        job_row = QHBoxLayout()
+        self.compare_job_combo = QComboBox()
+        self.compare_job_combo.addItem("\u2014 Select a job from the queue \u2014", None)
+        self.compare_job_combo.currentIndexChanged.connect(self._on_compare_job_combo_changed)
+        job_row.addWidget(self.compare_job_combo, 1)
+        form.addRow("Load from Job Queue:", job_row)
+
         self.output_edit = QLineEdit(os.path.join(os.getcwd(), "acl_comparison_report.csv"))
         output_row = self._path_row(self.output_edit, is_save=True, filter_str="CSV files (*.csv)")
         form.addRow("Output CSV:", output_row)
@@ -806,6 +813,31 @@ class MainWindow(QMainWindow):
             ]
             row[0].setData(job["job_id"], Qt.UserRole)
             self.jobs_model.appendRow(row)
+        self._refresh_compare_job_combo()
+
+    def _refresh_compare_job_combo(self) -> None:
+        if not hasattr(self, "compare_job_combo"):
+            return
+        current_id = self.compare_job_combo.currentData()
+        self.compare_job_combo.blockSignals(True)
+        self.compare_job_combo.clear()
+        self.compare_job_combo.addItem("\u2014 Select a job from the queue \u2014", None)
+        for job in store.list_jobs():
+            self.compare_job_combo.addItem(job["name"], job["job_id"])
+        idx = self.compare_job_combo.findData(current_id)
+        self.compare_job_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.compare_job_combo.blockSignals(False)
+
+    def _on_compare_job_combo_changed(self, _index: int) -> None:
+        job_id = self.compare_job_combo.currentData()
+        if not job_id:
+            return
+        job = store.get_job(job_id)
+        if not job:
+            return
+        self.source_edit.setText(job["source"])
+        self.dest_edit.setText(job["dest"])
+        self.threads_spin.setValue(job["threads"])
 
     def _selected_job_id(self) -> str:
         indexes = self.jobs_table.selectionModel().selectedRows() if self.jobs_table.selectionModel() else []
