@@ -249,6 +249,14 @@ immediately run the ACL comparison against the same source/destination to
 verify the result - sync and compare share the same Source/Destination
 fields at the top of the window.
 
+**Schedule a Resync**: the Sync tab has a "Schedule a Resync..." button
+that opens the Job Queue's job editor pre-filled with the exact
+source/dest/mode/threads/retries currently set on the Sync tab (with a
+sensible Daily @ 02:00 starting schedule you're free to change) - a
+one-click way to turn a manual sync you just ran (or are about to run)
+into a recurring scheduled job, without re-typing anything into the Job
+Queue tab. See "Job Queue" above for what happens once it's saved.
+
 ## Building executables locally (Windows)
 
 ```

@@ -712,9 +712,16 @@ class MainWindow(QMainWindow):
         self.cancel_sync_btn = QPushButton("Cancel")
         self.cancel_sync_btn.setEnabled(False)
         self.cancel_sync_btn.clicked.connect(self.cancel_sync)
+        self.schedule_resync_btn = QPushButton("Schedule a Resync...")
+        self.schedule_resync_btn.setToolTip(
+            "Create a Job Queue entry with these exact source/dest/mode/threads/retries, "
+            "so this sync can repeat on a schedule."
+        )
+        self.schedule_resync_btn.clicked.connect(self.on_schedule_resync)
         controls.addWidget(self.preview_btn)
         controls.addWidget(self.run_sync_btn)
         controls.addWidget(self.cancel_sync_btn)
+        controls.addWidget(self.schedule_resync_btn)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -745,6 +752,32 @@ class MainWindow(QMainWindow):
             self.run_sync_btn.setEnabled(self.mirror_confirm_chk.isChecked())
         else:
             self.run_sync_btn.setEnabled(True)
+
+    def on_schedule_resync(self) -> None:
+        source = self.source_edit.text().strip()
+        dest = self.dest_edit.text().strip()
+        if not source or not dest:
+            QMessageBox.information(self, APP_TITLE, "Enter a source and destination first.")
+            return
+
+        folder_name = os.path.basename(source.rstrip("\\/")) or source
+        seed = {
+            "name": f"Resync: {folder_name}",
+            "source": source,
+            "dest": dest,
+            "mode": "mirror" if self.mode_mirror_radio.isChecked() else "copy",
+            "threads": self.sync_threads_spin.value(),
+            "retries": self.sync_retries_spin.value(),
+            "auto_verify_acl": False,
+            "enabled": True,
+            "schedule_expr": "daily@02:00",  # sensible starting point - the whole point of this button is to add one
+        }
+        dialog = JobEditorDialog(self, job=seed, window_title="Schedule a Resync")
+        if dialog.exec_() == QDialog.Accepted:
+            job_id = store.create_job(**dialog.values())
+            self.refresh_jobs_table()
+            self._sync_job_schedule(job_id)
+            self.tabs.setCurrentIndex(2)  # Job Queue tab
 
     # -------------------------------------------------------- Compare tab --
     def _build_compare_tab(self) -> QWidget:
