@@ -1,0 +1,163 @@
+name: Build Executables
+
+# TFSync (Total File Sync) — build pipeline
+#
+# Builds:
+#   - Windows: full tool as raw executables AND as a proper installer
+#     (compare_acls.exe, compare_acls_gui.exe, sync_shares.exe,
+#     decode_mask.exe, TFSync_Setup.exe)
+#   - Linux / macOS (x86_64 + arm64): decode_mask only
+#
+# Why not the full tool on Linux/macOS? compare_acls.py and compare_acls_gui.py
+# read NTFS security descriptors via pywin32's win32security.GetFileSecurity(),
+# a Windows-only API with no cross-platform equivalent for this purpose.
+# sync_shares.py wraps robocopy, a Windows-only tool. All three already detect
+# this at runtime and print a clear "must run on Windows" error, so there's no
+# point shipping a broken binary for those platforms. decode_mask.py is pure
+# Python with no OS-specific dependency, so it builds and works everywhere.
+#
+# The installer is built with Inno Setup, which ships preinstalled on GitHub's
+# windows-latest runners at the fixed path used below - no extra setup step
+# needed.
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build-windows:
+    name: Build Windows executables + installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build CLI (compare_acls.exe)
+        run: >
+          pyinstaller --onefile --console --name compare_acls
+          --hidden-import=win32timezone
+          --hidden-import=win32security
+          --hidden-import=win32process
+          --hidden-import=ntsecuritycon
+          compare_acls.py
+
+      - name: Build GUI (compare_acls_gui.exe)
+        run: >
+          pyinstaller --onefile --console --name compare_acls_gui
+          --hidden-import=win32timezone
+          --hidden-import=win32security
+          --hidden-import=win32process
+          --hidden-import=ntsecuritycon
+          --hidden-import=PyQt5.sip
+          compare_acls_gui.py
+
+      - name: Build decode_mask.exe
+        run: pyinstaller --onefile --console --name decode_mask decode_mask.py
+
+      - name: Build sync CLI (sync_shares.exe)
+        run: >
+          pyinstaller --onefile --console --name sync_shares
+          --hidden-import=win32timezone
+          --hidden-import=win32security
+          --hidden-import=win32process
+          --hidden-import=ntsecuritycon
+          sync_shares.py
+
+      - name: Determine version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          if ($ref -match '^v(.+)') {
+            $version = $matches[1]
+          } else {
+            $version = "0.0.0-dev"
+          }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer with Inno Setup
+        shell: cmd
+        run: >
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          installer\compare_acls_installer.iss
+          /DMyAppVersion=${{ steps.version.outputs.version }}
+
+      - name: Upload raw executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-executables
+          path: |
+            dist/compare_acls.exe
+            dist/compare_acls_gui.exe
+            dist/sync_shares.exe
+            dist/decode_mask.exe
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-installer
+          path: installer/installer_output/TFSync_Setup.exe
+
+  build-decode-mask-cross-platform:
+    name: Build decode_mask (${{ matrix.artifact_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: linux-x86_64
+          - os: macos-26-intel
+            artifact_name: macos-x86_64
+          - os: macos-26
+            artifact_name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build decode_mask
+        run: pyinstaller --onefile --name decode_mask decode_mask.py
+
+      - name: Rename binary for this platform
+        shell: bash
+        run: mv dist/decode_mask dist/decode_mask-${{ matrix.artifact_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: decode_mask-${{ matrix.artifact_name }}
+          path: dist/decode_mask-${{ matrix.artifact_name }}
+
+  release:
+    name: Attach binaries to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-decode-mask-cross-platform]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release and upload binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
