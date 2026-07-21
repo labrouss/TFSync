@@ -4,11 +4,11 @@ name: Build Executables
 #
 # Builds:
 #   - Windows: full tool as raw executables AND as a proper installer
-#     (compare_acls.exe, compare_acls_gui.exe, sync_shares.exe,
+#     (compare_acls.exe, tfsync_gui.exe, sync_shares.exe,
 #     decode_mask.exe, TFSync_Setup.exe)
 #   - Linux / macOS (x86_64 + arm64): decode_mask only
 #
-# Why not the full tool on Linux/macOS? compare_acls.py and compare_acls_gui.py
+# Why not the full tool on Linux/macOS? compare_acls.py and tfsync_gui.py
 # read NTFS security descriptors via pywin32's win32security.GetFileSecurity(),
 # a Windows-only API with no cross-platform equivalent for this purpose.
 # sync_shares.py wraps robocopy, a Windows-only tool. All three already detect
@@ -51,15 +51,15 @@ jobs:
           --hidden-import=ntsecuritycon
           compare_acls.py
 
-      - name: Build GUI (compare_acls_gui.exe)
+      - name: Build GUI (tfsync_gui.exe)
         run: >
-          pyinstaller --onefile --console --name compare_acls_gui
+          pyinstaller --onefile --console --name tfsync_gui
           --hidden-import=win32timezone
           --hidden-import=win32security
           --hidden-import=win32process
           --hidden-import=ntsecuritycon
           --hidden-import=PyQt5.sip
-          compare_acls_gui.py
+          tfsync_gui.py
 
       - name: Build decode_mask.exe
         run: pyinstaller --onefile --console --name decode_mask decode_mask.py
@@ -98,7 +98,7 @@ jobs:
           name: windows-x86_64-executables
           path: |
             dist/compare_acls.exe
-            dist/compare_acls_gui.exe
+            dist/tfsync_gui.exe
             dist/sync_shares.exe
             dist/decode_mask.exe
 

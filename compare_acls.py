@@ -21,7 +21,7 @@ USAGE
     Optional:
         --dirs-only     only compare folder-level permissions (skip files)
 
-Also see compare_acls_gui.py for a PyQt5 GUI front-end to this same engine.
+Also see tfsync_gui.py for a PyQt5 GUI front-end to this same engine.
 """
 
 import argparse

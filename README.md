@@ -13,12 +13,65 @@ standalone helper for decoding raw permission masks.
 
 ## Roadmap
 
-Scheduling (unattended recurring syncs via Windows Task Scheduler), run
-history (SQLite-backed, per-run logging of throughput/exit codes/ACL-check
-results), and licensing scaffolding (a stubbed always-unlimited
-`LicenseManager`/`UsageTracker`, free tier capped at 100GB lifetime) are
-planned next. The sync and ACL-comparison engines below are already
-functional; the queue/scheduling layer is not yet built.
+A local job queue and run history (both SQLite-backed) now exist in the GUI
+(tabs 3 and 4 below), along with licensing scaffolding (a stubbed
+always-unlimited `LicenseManager`/`UsageTracker`, free tier capped at
+100GB lifetime). **Not yet built**: the Windows Task Scheduler integration
+that would actually register jobs to run unattended - job definitions store
+a schedule expression today, but nothing acts on it yet, so jobs only run
+when you click "Run Now".
+
+## Job Queue (GUI tab 3)
+
+Define reusable sync jobs (name, source, dest, mode, thread/retry settings,
+optional auto-chained ACL verification, a schedule expression field that's
+stored but not yet enforced) and run them on demand with **Run Now**. A few
+notes on how this behaves today:
+
+- **Max concurrent jobs** (default 2) is an actual cap - "Run Now" is
+  blocked once that many jobs are running at once, to avoid an unbounded
+  pile of simultaneous robocopy processes.
+- **Thread warning threshold** (default 64) is a soft warning, not a cap -
+  the "Active jobs" banner turns orange and explains why, but won't stop
+  you from proceeding, since the queue length itself is intentionally
+  unbounded (per the design brief).
+- Jobs with **auto-verify ACL** enabled kick off a background ACL
+  comparison after a successful (non-dry-run, non-cancelled) run and
+  write its report to `job_reports/`; the summary counts get attached to
+  that run's history entry once the comparison finishes.
+- **Deleting a job decommissions it**: it unregisters any scheduled task
+  (a no-op today - there's nothing to unregister until the Task Scheduler
+  integration exists, but the hook is already wired in) and **deletes all
+  of that job's run history** from the database. The confirmation dialog
+  tells you how many history rows will go with it. Lifetime usage totals
+  used for the licensing quota are kept regardless, since those bytes were
+  actually transferred whether or not the job/its logs still exist.
+
+## Run History (GUI tab 4)
+
+Every sync run - manual (from tab 1) or from the Job Queue - is logged to
+a local SQLite database (`tfsync_store.py`), including start/end time,
+duration, mode, dry-run flag, dirs/files copied/skipped/failed/extras,
+bytes copied, derived MB/s and seconds-per-GB, exit code + description,
+and any chained ACL comparison summary. Filter by job (or "All runs") and
+hit Refresh to pull the latest. Failed runs are highlighted in red.
+
+**Retention**: history is capped per job (and separately for manual/ad-hoc
+runs) so the database doesn't grow forever. Options, top of the Run
+History tab:
+- **Keep all runs** - no pruning
+- **Keep last run only**
+- **Keep last N runs** (default 50) - your own number
+
+The chosen policy is applied automatically after every new run is
+recorded, and can also be run immediately with **Apply Retention Now**
+(e.g. right after lowering the number, to prune existing history down to
+size). Pruning never touches the lifetime usage ledger used for the
+licensing quota - that total is intentionally independent of how much
+history you choose to keep.
+
+The underlying database lives at
+`%LOCALAPPDATA%\TFSync\tfsync.db` (see `tfsync_store.DEFAULT_DB_PATH`).
 
 ## Platform support (please read)
 
@@ -29,7 +82,7 @@ That means:
 | Component | Windows | Linux / macOS |
 |---|---|---|
 | `compare_acls.py` (CLI) | ✅ Full functionality | ❌ Exits with a clear error |
-| `compare_acls_gui.py` (GUI) | ✅ Full functionality | ❌ Shows a clear error dialog |
+| `tfsync_gui.py` (GUI) | ✅ Full functionality | ❌ Shows a clear error dialog |
 | `decode_mask.py` (mask decoder) | ✅ | ✅ Pure Python, works everywhere |
 
 The GitHub Actions workflow reflects this: it builds full Windows executables
@@ -79,7 +132,7 @@ only ever print "this must run on Windows."
 ```
 acl_compare_core.py                    Shared comparison engine (used by CLI and GUI)
 compare_acls.py                        Command-line interface (compare)
-compare_acls_gui.py                    PyQt5 graphical interface (sync + compare)
+tfsync_gui.py                    PyQt5 graphical interface (sync + compare)
 robocopy_sync.py                       Shared robocopy wrapper engine (used by CLI and GUI)
 sync_shares.py                         Command-line interface (sync)
 decode_mask.py                         Standalone access-mask decoder (cross-platform)
@@ -107,10 +160,11 @@ Useful flags:
 
 GUI:
 ```
-python compare_acls_gui.py
+python tfsync_gui.py
 ```
 All of the above are available as fields/checkboxes in the GUI, plus a
-dark/light theme toggle (dark by default).
+dark/light theme toggle (dark by default), a **Job Queue** tab for saved/
+recurring job definitions, and a **Run History** tab (see above).
 
 Decode a raw access mask on its own, no Windows required:
 ```
@@ -157,7 +211,7 @@ pip install -r requirements.txt
 pip install pyinstaller
 build.bat
 ```
-Produces `dist\compare_acls.exe`, `dist\compare_acls_gui.exe`, and
+Produces `dist\compare_acls.exe`, `dist\tfsync_gui.exe`, and
 `dist\decode_mask.exe`. The GUI build defaults to `--console` so startup
 errors are visible on first run; switch to `--windowed` in `build.bat` once
 you've confirmed it runs cleanly.
@@ -175,7 +229,7 @@ note - the raw `.exe` files still work fine on their own.
 
 Push a tag matching `v*` (e.g. `v1.0.0`), or trigger the workflow manually
 from the Actions tab. It builds:
-- **Windows**: `compare_acls.exe`, `compare_acls_gui.exe`, `decode_mask.exe`,
+- **Windows**: `compare_acls.exe`, `tfsync_gui.exe`, `decode_mask.exe`,
   and `TFSync_Setup.exe` (the installer, versioned from the tag)
 - **Linux (x86_64)**, **macOS (x86_64)**, **macOS (arm64)**: `decode_mask`
   only, for the reasons explained above

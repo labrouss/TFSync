@@ -91,12 +91,28 @@ CREATE INDEX IF NOT EXISTS idx_run_history_start_time ON run_history (start_time
 
 CREATE TABLE IF NOT EXISTS usage_ledger (
     entry_id     TEXT PRIMARY KEY,
-    run_id       TEXT NOT NULL,
+    run_id       TEXT NOT NULL,   -- informational only, deliberately NOT a foreign key: usage must
+                                   -- survive run_history pruning/job deletion so lifetime quota stays accurate
     bytes_copied INTEGER NOT NULL,
-    recorded_at  TEXT NOT NULL,
-    FOREIGN KEY (run_id) REFERENCES run_history (run_id)
+    recorded_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 """
+
+# Retention policy: how many run_history rows to keep, per job_id bucket
+# (each job_id keeps its own last-N, and manual/ad-hoc runs - job_id IS NULL -
+# are their own bucket). Applied automatically after every recorded run, and
+# on demand via apply_retention_policy(). Does not touch usage_ledger, so
+# lifetime quota totals (UsageTracker) stay correct regardless of how much
+# history has been pruned.
+RETENTION_MODE_ALL = "all"          # never prune
+RETENTION_MODE_COUNT = "count"      # keep last N runs per job (and per the manual bucket)
+DEFAULT_RETENTION_MODE = RETENTION_MODE_COUNT
+DEFAULT_RETENTION_COUNT = 50
 
 
 def _utcnow_iso() -> str:
@@ -167,9 +183,37 @@ def update_job(job_id: str, db_path: Path = DEFAULT_DB_PATH, **fields: Any) -> N
         conn.execute(f"UPDATE jobs SET {set_clause} WHERE job_id = ?", (*fields.values(), job_id))
 
 
-def delete_job(job_id: str, db_path: Path = DEFAULT_DB_PATH) -> None:
+def _unregister_scheduled_task(job_id: str) -> None:
+    """
+    Placeholder hook: once the Task Scheduler integration layer exists, this
+    is where a job's registered Windows scheduled task gets removed as part
+    of decommissioning. No-op today since nothing is registered yet.
+    """
+    return None
+
+
+def delete_job(job_id: str, db_path: Path = DEFAULT_DB_PATH) -> int:
+    """
+    Decommissions a job: unregisters any scheduled task (no-op until that
+    integration exists), deletes the job definition, and deletes its run
+    history. Lifetime usage totals are unaffected (usage_ledger has no FK
+    to run_history for exactly this reason). Returns the number of
+    run_history rows deleted.
+    """
+    _unregister_scheduled_task(job_id)
     with _connect(db_path) as conn:
+        deleted = conn.execute("DELETE FROM run_history WHERE job_id = ?", (job_id,)).rowcount
         conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+    return deleted
+
+
+def count_run_history(job_id: Optional[str] = None, db_path: Path = DEFAULT_DB_PATH) -> int:
+    with _connect(db_path) as conn:
+        if job_id:
+            row = conn.execute("SELECT COUNT(*) AS n FROM run_history WHERE job_id = ?", (job_id,)).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS n FROM run_history").fetchone()
+        return int(row["n"])
 
 
 def get_job(job_id: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
@@ -284,7 +328,21 @@ def record_run(
                 "INSERT INTO usage_ledger (entry_id, run_id, bytes_copied, recorded_at) VALUES (?, ?, ?, ?)",
                 (_new_id(), run_id, bytes_copied, _utcnow_iso()),
             )
+    apply_retention_policy(db_path=db_path)
     return run_id
+
+
+def update_run_acl_summary(run_id: str, acl_summary: Dict[str, int], db_path: Path = DEFAULT_DB_PATH) -> None:
+    """
+    Attaches a chained ACL-comparison summary to an already-recorded run
+    (used when the comparison is kicked off after the sync completes,
+    rather than known at record_run() time).
+    """
+    with _connect(db_path) as conn:
+        conn.execute(
+            "UPDATE run_history SET acl_chained = 1, acl_summary_json = ? WHERE run_id = ?",
+            (json.dumps(acl_summary), run_id),
+        )
 
 
 def list_run_history(
@@ -301,6 +359,83 @@ def list_run_history(
     params.append(limit)
     with _connect(db_path) as conn:
         return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+# --------------------------------------------------------------------------
+# Settings + run-history retention
+# --------------------------------------------------------------------------
+
+def get_setting(key: str, default: Optional[str] = None, db_path: Path = DEFAULT_DB_PATH) -> Optional[str]:
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str, db_path: Path = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def get_retention_policy(db_path: Path = DEFAULT_DB_PATH) -> "tuple[str, int]":
+    """Returns (mode, count) - mode is RETENTION_MODE_ALL or RETENTION_MODE_COUNT."""
+    mode = get_setting("history_retention_mode", DEFAULT_RETENTION_MODE, db_path=db_path)
+    count = int(get_setting("history_retention_count", str(DEFAULT_RETENTION_COUNT), db_path=db_path))
+    return mode, count
+
+
+def set_retention_policy(mode: str, count: int = DEFAULT_RETENTION_COUNT, db_path: Path = DEFAULT_DB_PATH) -> None:
+    if mode not in (RETENTION_MODE_ALL, RETENTION_MODE_COUNT):
+        raise ValueError(f"Unknown retention mode: {mode}")
+    set_setting("history_retention_mode", mode, db_path=db_path)
+    set_setting("history_retention_count", str(max(1, count)), db_path=db_path)
+
+
+def apply_retention_policy(db_path: Path = DEFAULT_DB_PATH) -> int:
+    """
+    Prunes run_history down to the configured retention policy: for each
+    job_id bucket (each saved job keeps its own last-N; ad-hoc/manual runs
+    - job_id IS NULL - are their own bucket), deletes everything past the
+    most recent N rows by start_time. A no-op if the policy is "keep all".
+    Never touches usage_ledger, so lifetime quota totals are unaffected.
+    Returns the number of rows deleted.
+    """
+    mode, count = get_retention_policy(db_path=db_path)
+    if mode == RETENTION_MODE_ALL:
+        return 0
+    with _connect(db_path) as conn:
+        buckets = [row["job_id"] for row in conn.execute(
+            "SELECT DISTINCT job_id FROM run_history"
+        ).fetchall()]
+        deleted = 0
+        for job_id in buckets:
+            if job_id is None:
+                ids_to_keep = conn.execute(
+                    "SELECT run_id FROM run_history WHERE job_id IS NULL "
+                    "ORDER BY start_time DESC LIMIT ?", (count,)
+                ).fetchall()
+                keep_ids = [r["run_id"] for r in ids_to_keep]
+                placeholders = ",".join("?" * len(keep_ids)) if keep_ids else "''"
+                result = conn.execute(
+                    f"DELETE FROM run_history WHERE job_id IS NULL AND run_id NOT IN ({placeholders})",
+                    keep_ids,
+                )
+            else:
+                ids_to_keep = conn.execute(
+                    "SELECT run_id FROM run_history WHERE job_id = ? "
+                    "ORDER BY start_time DESC LIMIT ?", (job_id, count)
+                ).fetchall()
+                keep_ids = [r["run_id"] for r in ids_to_keep]
+                placeholders = ",".join("?" * len(keep_ids)) if keep_ids else "''"
+                result = conn.execute(
+                    f"DELETE FROM run_history WHERE job_id = ? AND run_id NOT IN ({placeholders})",
+                    (job_id, *keep_ids),
+                )
+            deleted += result.rowcount
+    return deleted
 
 
 # --------------------------------------------------------------------------
@@ -424,3 +559,18 @@ if __name__ == "__main__":
 
         tracker = UsageTracker(db_path=demo_db)
         print("Usage check:", tracker.check_before_run(estimated_bytes=50 * 1024**3))
+
+        # --- Retention policy ---
+        set_retention_policy(RETENTION_MODE_COUNT, 3, db_path=demo_db)
+        for _ in range(5):
+            record_run(fake_result, r"\\src\finance", r"\\dst\finance", mode="mirror", dry_run=False,
+                       start_time=start, end_time=end, job_id=job_id, db_path=demo_db)
+        print("Rows before prune:", count_run_history(job_id, db_path=demo_db))
+        deleted = apply_retention_policy(db_path=demo_db)
+        print("Pruned rows:", deleted, "-> rows now:", count_run_history(job_id, db_path=demo_db))
+        print("Lifetime usage survives pruning:", tracker.bytes_used_lifetime() / (1024**3), "GB")
+
+        # --- Cascading job deletion (decommissioning) ---
+        removed_history = delete_job(job_id, db_path=demo_db)
+        print(f"Deleted job + {removed_history} history rows. Job now:", get_job(job_id, db_path=demo_db))
+        print("Lifetime usage still intact after job deletion:", tracker.bytes_used_lifetime() / (1024**3), "GB")

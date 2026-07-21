@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-SMB/CIFS NTFS Permission Comparison Tool (GUI)
-================================================
+TFSync (Total File Sync) — GUI
 
-PyQt5 front-end for acl_compare_core.py. Lets you pick a source and
-destination UNC path, run the comparison in the background, and browse
-the resulting differences in a filterable, sortable table.
+PyQt5 front-end combining robocopy-based sync, ACL comparison
+(acl_compare_core.py), and a local job queue / run history backed by
+tfsync_store.py. Lets you pick a source and destination UNC path, run a
+sync and/or comparison in the background, browse results in a
+filterable/sortable table, and manage recurring job definitions.
 
 REQUIREMENTS
     - Must run on Windows (uses the Win32 security APIs via pywin32).
     - pip install pywin32 PyQt5
 
 USAGE
-    python compare_acls_gui.py
+    python tfsync_gui.py
 """
 
 import csv
+import json
 import os
 import sys
+import uuid
+from datetime import datetime, timezone
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QDir
 from PyQt5.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPalette
@@ -26,10 +30,12 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QCheckBox, QLabel, QProgressBar, QPlainTextEdit,
     QTableView, QFileDialog, QMessageBox, QGroupBox, QComboBox, QHeaderView,
     QSplitter, QStyleFactory, QSpinBox, QTabWidget, QRadioButton, QButtonGroup,
+    QDialog, QDialogButtonBox, QAbstractItemView,
 )
 
 import acl_compare_core as core
 import robocopy_sync
+import tfsync_store as store
 
 APP_TITLE = "TFSync — Total File Sync"
 
@@ -191,6 +197,13 @@ DIFF_TYPES = [
     "ACE_MISSING_IN_DEST", "ACE_ADDED_IN_DEST", "READ_ERROR", "MATCH",
 ]
 
+JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
+               "Auto-Verify ACL", "Enabled", "Last Status"]
+
+HISTORY_COLUMNS = ["Start Time", "Job", "Source", "Destination", "Mode", "Dry Run",
+                    "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
+                    "Description", "ACL Chained"]
+
 
 class ScanWorker(QThread):
     log = pyqtSignal(str)
@@ -270,6 +283,120 @@ class SyncWorker(QThread):
             self.failed.emit(str(e))
 
 
+class JobEditorDialog(QDialog):
+    """
+    Create/edit a job definition. Schedule expression is free-text for now
+    ("daily@02:00", "weekly:Sat@03:30", etc.) - the Task Scheduler
+    integration layer that actually parses this and registers a real
+    scheduled task is a separate piece of work, not yet built. Saving a
+    job here only stores the definition; it does not (yet) register
+    anything with Windows Task Scheduler.
+    """
+
+    def __init__(self, parent=None, job: dict = None):
+        super().__init__(parent)
+        self.job = job
+        self.setWindowTitle("Edit Job" if job else "New Job")
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.name_edit = QLineEdit(job["name"] if job else "")
+        self.name_edit.setPlaceholderText("e.g. Nightly finance share sync")
+        form.addRow("Name:", self.name_edit)
+
+        self.source_edit = QLineEdit(job["source"] if job else "")
+        self.source_edit.setPlaceholderText(r"\\srcserver\share\path")
+        form.addRow("Source:", self._path_row(self.source_edit))
+
+        self.dest_edit = QLineEdit(job["dest"] if job else "")
+        self.dest_edit.setPlaceholderText(r"\\dstserver\share\path")
+        form.addRow("Destination:", self._path_row(self.dest_edit))
+
+        mode_row = QHBoxLayout()
+        self.mode_copy_radio = QRadioButton("Copy-only")
+        self.mode_mirror_radio = QRadioButton("Mirror")
+        mode_group = QButtonGroup(self)
+        mode_group.addButton(self.mode_copy_radio)
+        mode_group.addButton(self.mode_mirror_radio)
+        if job and job.get("mode") == "mirror":
+            self.mode_mirror_radio.setChecked(True)
+        else:
+            self.mode_copy_radio.setChecked(True)
+        mode_row.addWidget(self.mode_copy_radio)
+        mode_row.addWidget(self.mode_mirror_radio)
+        form.addRow("Mode:", mode_row)
+
+        self.schedule_edit = QLineEdit(job["schedule_expr"] if job and job.get("schedule_expr") else "")
+        self.schedule_edit.setPlaceholderText(
+            "e.g. daily@02:00 (Task Scheduler integration coming soon - stored but not yet enforced)"
+        )
+        form.addRow("Schedule:", self.schedule_edit)
+
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(1, 128)
+        self.threads_spin.setValue(job["threads"] if job else 16)
+        form.addRow("Threads (/MT):", self.threads_spin)
+
+        self.retries_spin = QSpinBox()
+        self.retries_spin.setRange(0, 100)
+        self.retries_spin.setValue(job["retries"] if job else 3)
+        form.addRow("Retries:", self.retries_spin)
+
+        self.auto_verify_chk = QCheckBox("Automatically run ACL comparison after each successful run")
+        self.auto_verify_chk.setChecked(bool(job["auto_verify_acl"]) if job else False)
+        form.addRow("", self.auto_verify_chk)
+
+        self.enabled_chk = QCheckBox("Enabled")
+        self.enabled_chk.setChecked(bool(job["enabled"]) if job else True)
+        form.addRow("", self.enabled_chk)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _path_row(self, edit: QLineEdit) -> QWidget:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.addWidget(edit)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(lambda: self._browse_dir(edit))
+        row_layout.addWidget(browse_btn)
+        return row
+
+    def _browse_dir(self, edit: QLineEdit) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select folder", edit.text())
+        if path:
+            edit.setText(QDir.toNativeSeparators(path))
+
+    def _on_accept(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Job Queue", "Please provide a job name.")
+            return
+        if not self.source_edit.text().strip() or not self.dest_edit.text().strip():
+            QMessageBox.warning(self, "Job Queue", "Please provide both a source and destination path.")
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        return {
+            "name": self.name_edit.text().strip(),
+            "source": self.source_edit.text().strip(),
+            "dest": self.dest_edit.text().strip(),
+            "mode": "mirror" if self.mode_mirror_radio.isChecked() else "copy",
+            "schedule_expr": self.schedule_edit.text().strip() or None,
+            "threads": self.threads_spin.value(),
+            "retries": self.retries_spin.value(),
+            "auto_verify_acl": self.auto_verify_chk.isChecked(),
+            "enabled": self.enabled_chk.isChecked(),
+        }
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -285,8 +412,22 @@ class MainWindow(QMainWindow):
         self._output_manual = False
         self._sync_log_manual = False
 
+        store.init_db()
+        self._sync_source = ""
+        self._sync_dest = ""
+        self._sync_mode = "copy"
+        self._sync_start_time = None
+        self._last_manual_run_id = None
+        self._pending_acl_chain_run_id = None
+        self._active_job_runs: dict = {}   # job_id -> {"worker": SyncWorker, "start_time": datetime, "run_id": str or None}
+        self._job_acl_workers: list = []   # keep references so headless ACL-verify threads aren't garbage collected
+        self.max_concurrent_jobs = 2
+        self.thread_warning_threshold = 64
+
         self._build_ui()
         self._apply_theme()
+        self.refresh_jobs_table()
+        self.refresh_history_table()
 
     # ---------------------------------------------------------------- UI --
     def _build_ui(self) -> None:
@@ -324,6 +465,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_sync_tab(), "1. Sync (robocopy)")
         self.tabs.addTab(self._build_compare_tab(), "2. Compare ACLs")
+        self.tabs.addTab(self._build_queue_tab(), "3. Job Queue")
+        self.tabs.addTab(self._build_history_tab(), "4. Run History")
         root_layout.addWidget(self.tabs, 1)
 
         # Auto-fill resolve-host / output filename / sync log from the
@@ -552,6 +695,436 @@ class MainWindow(QMainWindow):
 
         return tab
 
+    # ------------------------------------------------------------ Queue tab --
+    def _build_queue_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        note = QLabel(
+            "Job definitions are stored locally (SQLite) and can be run on demand with "
+            "\u201cRun Now\u201d. Actually running them unattended on a schedule requires the "
+            "Windows Task Scheduler integration layer, which isn't built yet - the "
+            "Schedule field is stored but not yet enforced."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #999; font-style: italic;")
+        layout.addWidget(note)
+
+        settings_row = QHBoxLayout()
+        settings_row.addWidget(QLabel("Max concurrent jobs:"))
+        self.max_concurrent_spin = QSpinBox()
+        self.max_concurrent_spin.setRange(1, 20)
+        self.max_concurrent_spin.setValue(self.max_concurrent_jobs)
+        self.max_concurrent_spin.valueChanged.connect(self._on_max_concurrent_changed)
+        settings_row.addWidget(self.max_concurrent_spin)
+        settings_row.addSpacing(20)
+        settings_row.addWidget(QLabel("Thread warning threshold:"))
+        self.thread_warning_spin = QSpinBox()
+        self.thread_warning_spin.setRange(1, 1000)
+        self.thread_warning_spin.setValue(self.thread_warning_threshold)
+        self.thread_warning_spin.valueChanged.connect(self._on_thread_warning_changed)
+        settings_row.addWidget(self.thread_warning_spin)
+        settings_row.addStretch()
+        layout.addLayout(settings_row)
+
+        self.active_jobs_label = QLabel()
+        self.active_jobs_label.setStyleSheet("font-weight: 600; padding: 4px;")
+        layout.addWidget(self.active_jobs_label)
+        self._update_active_jobs_label()
+
+        self.jobs_model = QStandardItemModel(0, len(JOB_COLUMNS))
+        self.jobs_model.setHorizontalHeaderLabels(JOB_COLUMNS)
+        self.jobs_table = QTableView()
+        self.jobs_table.setModel(self.jobs_model)
+        self.jobs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.jobs_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.jobs_table.setEditTriggers(QTableView.NoEditTriggers)
+        self.jobs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.jobs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        layout.addWidget(self.jobs_table, 1)
+
+        controls = QHBoxLayout()
+        new_btn = QPushButton("New Job...")
+        new_btn.clicked.connect(self.on_new_job)
+        edit_btn = QPushButton("Edit Job...")
+        edit_btn.clicked.connect(self.on_edit_job)
+        delete_btn = QPushButton("Delete Job")
+        delete_btn.clicked.connect(self.on_delete_job)
+        run_btn = QPushButton("Run Now")
+        run_btn.clicked.connect(self.on_run_job_now)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_jobs_table)
+        controls.addWidget(new_btn)
+        controls.addWidget(edit_btn)
+        controls.addWidget(delete_btn)
+        controls.addWidget(run_btn)
+        controls.addStretch()
+        controls.addWidget(refresh_btn)
+        layout.addLayout(controls)
+
+        return tab
+
+    def _on_max_concurrent_changed(self, value: int) -> None:
+        self.max_concurrent_jobs = value
+        self._update_active_jobs_label()
+
+    def _on_thread_warning_changed(self, value: int) -> None:
+        self.thread_warning_threshold = value
+        self._update_active_jobs_label()
+
+    def _update_active_jobs_label(self) -> None:
+        active_count = len(self._active_job_runs)
+        combined_threads = sum(entry["threads"] for entry in self._active_job_runs.values())
+        text = (f"Active jobs: {active_count} / {self.max_concurrent_jobs}  |  "
+                f"Combined robocopy threads: {combined_threads}")
+        if combined_threads > self.thread_warning_threshold:
+            text += f"  \u26a0 over warning threshold of {self.thread_warning_threshold} - risk of saturating the link"
+            self.active_jobs_label.setStyleSheet(
+                "font-weight: 600; padding: 4px; background-color: #7a4a00; color: white; border-radius: 4px;"
+            )
+        else:
+            self.active_jobs_label.setStyleSheet("font-weight: 600; padding: 4px;")
+        self.active_jobs_label.setText(text)
+
+    def refresh_jobs_table(self) -> None:
+        self.jobs_model.removeRows(0, self.jobs_model.rowCount())
+        for job in store.list_jobs():
+            row = [
+                QStandardItem(job["name"]),
+                QStandardItem(job["source"]),
+                QStandardItem(job["dest"]),
+                QStandardItem(job["mode"]),
+                QStandardItem(job["schedule_expr"] or ""),
+                QStandardItem(str(job["threads"])),
+                QStandardItem("Yes" if job["auto_verify_acl"] else "No"),
+                QStandardItem("Yes" if job["enabled"] else "No"),
+                QStandardItem(job["last_run_status"] or "Never run"),
+            ]
+            row[0].setData(job["job_id"], Qt.UserRole)
+            self.jobs_model.appendRow(row)
+
+    def _selected_job_id(self) -> str:
+        indexes = self.jobs_table.selectionModel().selectedRows() if self.jobs_table.selectionModel() else []
+        if not indexes:
+            return None
+        return self.jobs_model.item(indexes[0].row(), 0).data(Qt.UserRole)
+
+    def on_new_job(self) -> None:
+        dialog = JobEditorDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            values = dialog.values()
+            store.create_job(**values)
+            self.refresh_jobs_table()
+
+    def on_edit_job(self) -> None:
+        job_id = self._selected_job_id()
+        if not job_id:
+            QMessageBox.information(self, APP_TITLE, "Select a job to edit first.")
+            return
+        job = store.get_job(job_id)
+        dialog = JobEditorDialog(self, job=job)
+        if dialog.exec_() == QDialog.Accepted:
+            store.update_job(job_id, **dialog.values())
+            self.refresh_jobs_table()
+
+    def on_delete_job(self) -> None:
+        job_id = self._selected_job_id()
+        if not job_id:
+            QMessageBox.information(self, APP_TITLE, "Select a job to delete first.")
+            return
+        if job_id in self._active_job_runs:
+            QMessageBox.warning(self, APP_TITLE, "This job is currently running - wait for it to finish before deleting it.")
+            return
+        job = store.get_job(job_id)
+        history_count = store.count_run_history(job_id)
+        reply = QMessageBox.question(
+            self, APP_TITLE,
+            f"Decommission \u201c{job['name']}\u201d?\n\n"
+            f"This deletes the job definition and all {history_count} of its run history "
+            f"record(s). This cannot be undone.\n\n"
+            f"(Lifetime usage totals for licensing are unaffected either way.)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            store.delete_job(job_id)
+            self.refresh_jobs_table()
+            self.refresh_history_table()
+
+    def on_run_job_now(self) -> None:
+        job_id = self._selected_job_id()
+        if not job_id:
+            QMessageBox.information(self, APP_TITLE, "Select a job to run first.")
+            return
+        if job_id in self._active_job_runs:
+            QMessageBox.information(self, APP_TITLE, "This job is already running.")
+            return
+        if len(self._active_job_runs) >= self.max_concurrent_jobs:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                f"Max concurrent jobs ({self.max_concurrent_jobs}) reached.\n"
+                f"Wait for a running job to finish, or raise the limit above the job table."
+            )
+            return
+
+        job = store.get_job(job_id)
+        if os.name != "nt":
+            QMessageBox.critical(self, APP_TITLE, "This tool must be run on Windows (robocopy is a Windows-only tool).")
+            return
+        if core.paths_are_same(job["source"], job["dest"]):
+            QMessageBox.warning(self, APP_TITLE, "Source and destination are the same path for this job.")
+            return
+
+        mirror = job["mode"] == "mirror"
+        if mirror:
+            reply = QMessageBox.warning(
+                self, APP_TITLE,
+                f"\u201c{job['name']}\u201d is a MIRROR job - it will permanently delete files/folders "
+                f"in the destination that don't exist in the source.\n\nRun it now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        log_dir = os.path.join(os.getcwd(), "job_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
+        log_path = os.path.join(log_dir, f"{safe_name}_{uuid.uuid4().hex[:8]}.log")
+
+        worker = SyncWorker(
+            job["source"], job["dest"], mirror, False,
+            job["threads"], job["retries"], 5, True, log_path,
+        )
+        worker.finished_ok.connect(lambda result, jid=job_id: self._job_finished(jid, result))
+        worker.failed.connect(lambda message, jid=job_id: self._job_failed(jid, message))
+
+        self._active_job_runs[job_id] = {
+            "worker": worker, "start_time": datetime.now(timezone.utc), "threads": job["threads"],
+        }
+        self._update_active_jobs_label()
+        self.refresh_jobs_table()
+        worker.start()
+
+    def _job_finished(self, job_id: str, result: dict) -> None:
+        entry = self._active_job_runs.pop(job_id, None)
+        self._update_active_jobs_label()
+        if not entry:
+            return
+        job = store.get_job(job_id)
+        if not job:
+            self.refresh_jobs_table()
+            return
+        end_time = datetime.now(timezone.utc)
+        run_id = store.record_run(
+            result, job["source"], job["dest"], job["mode"], dry_run=False,
+            start_time=entry["start_time"], end_time=end_time, job_id=job_id,
+        )
+        self.refresh_jobs_table()
+        self.refresh_history_table()
+
+        if job["auto_verify_acl"] and not result["cancelled"] and not robocopy_sync.is_failure(result["exit_code"]):
+            self._start_headless_acl_verify(job, run_id)
+
+    def _job_failed(self, job_id: str, message: str) -> None:
+        self._active_job_runs.pop(job_id, None)
+        self._update_active_jobs_label()
+        self.refresh_jobs_table()
+        QMessageBox.critical(self, APP_TITLE, f"Job failed to start:\n{message}")
+
+    def _start_headless_acl_verify(self, job: dict, run_id: str) -> None:
+        """Runs an ACL comparison in the background (no table/log wired to the UI) and
+        attaches its summary to the just-recorded run once it finishes."""
+        report_dir = os.path.join(os.getcwd(), "job_reports")
+        os.makedirs(report_dir, exist_ok=True)
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
+        report_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_acl_report.csv")
+
+        worker = ScanWorker(job["source"], job["dest"], False, None, job["threads"], False)
+        csv_file = open(report_path, "w", newline="", encoding="utf-8-sig")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(core.ROW_FIELDS)
+
+        def on_row(row: dict) -> None:
+            csv_writer.writerow([row[field] for field in core.ROW_FIELDS])
+
+        def on_done(counts: dict) -> None:
+            csv_file.close()
+            acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
+            store.update_run_acl_summary(run_id, acl_summary)
+            self.refresh_history_table()
+            self._job_acl_workers[:] = [w for w in self._job_acl_workers if w is not worker]
+
+        def on_fail(message: str) -> None:
+            csv_file.close()
+            self._job_acl_workers[:] = [w for w in self._job_acl_workers if w is not worker]
+
+        worker.row_found.connect(on_row)
+        worker.finished_ok.connect(on_done)
+        worker.failed.connect(on_fail)
+        self._job_acl_workers.append(worker)
+        worker.start()
+
+    # ---------------------------------------------------------- History tab --
+    def _build_history_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        retention_box = QGroupBox("Retention")
+        retention_row = QHBoxLayout()
+        retention_row.addWidget(QLabel("Keep per job (and per manual runs):"))
+        self.retention_combo = QComboBox()
+        self.retention_combo.addItems(["Keep all runs", "Keep last run only", "Keep last N runs"])
+        self.retention_combo.currentIndexChanged.connect(self._on_retention_combo_changed)
+        retention_row.addWidget(self.retention_combo)
+
+        self.retention_count_spin = QSpinBox()
+        self.retention_count_spin.setRange(2, 100000)
+        self.retention_count_spin.setValue(store.DEFAULT_RETENTION_COUNT)
+        self.retention_count_spin.valueChanged.connect(self._on_retention_count_changed)
+        retention_row.addWidget(self.retention_count_spin)
+
+        retention_row.addStretch()
+        apply_retention_btn = QPushButton("Apply Retention Now")
+        apply_retention_btn.clicked.connect(self.on_apply_retention_now)
+        retention_row.addWidget(apply_retention_btn)
+        retention_box.setLayout(retention_row)
+        layout.addWidget(retention_box)
+
+        self._load_retention_policy_into_ui()
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Job:"))
+        self.history_job_combo = QComboBox()
+        self.history_job_combo.addItem("All runs", None)
+        self.history_job_combo.currentIndexChanged.connect(self.refresh_history_table)
+        filter_row.addWidget(self.history_job_combo)
+        filter_row.addStretch()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_history_table)
+        filter_row.addWidget(refresh_btn)
+        layout.addLayout(filter_row)
+
+        self.history_model = QStandardItemModel(0, len(HISTORY_COLUMNS))
+        self.history_model.setHorizontalHeaderLabels(HISTORY_COLUMNS)
+        self.history_table = QTableView()
+        self.history_table.setModel(self.history_model)
+        self.history_table.setSortingEnabled(True)
+        self.history_table.setEditTriggers(QTableView.NoEditTriggers)
+        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.history_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.Stretch)
+        layout.addWidget(self.history_table, 1)
+
+        self.history_row_count_label = QLabel()
+        self.history_row_count_label.setStyleSheet("color: #999; font-style: italic;")
+        layout.addWidget(self.history_row_count_label)
+
+        return tab
+
+    def _load_retention_policy_into_ui(self) -> None:
+        mode, count = store.get_retention_policy()
+        self.retention_combo.blockSignals(True)
+        self.retention_count_spin.blockSignals(True)
+        if mode == store.RETENTION_MODE_ALL:
+            self.retention_combo.setCurrentIndex(0)
+        elif count == 1:
+            self.retention_combo.setCurrentIndex(1)
+        else:
+            self.retention_combo.setCurrentIndex(2)
+        self.retention_count_spin.setValue(max(count, 2))
+        self.retention_count_spin.setEnabled(self.retention_combo.currentIndex() == 2)
+        self.retention_combo.blockSignals(False)
+        self.retention_count_spin.blockSignals(False)
+
+    def _save_retention_policy_from_ui(self) -> None:
+        idx = self.retention_combo.currentIndex()
+        if idx == 0:
+            store.set_retention_policy(store.RETENTION_MODE_ALL)
+        elif idx == 1:
+            store.set_retention_policy(store.RETENTION_MODE_COUNT, 1)
+        else:
+            store.set_retention_policy(store.RETENTION_MODE_COUNT, self.retention_count_spin.value())
+
+    def _on_retention_combo_changed(self, idx: int) -> None:
+        self.retention_count_spin.setEnabled(idx == 2)
+        self._save_retention_policy_from_ui()
+
+    def _on_retention_count_changed(self, _value: int) -> None:
+        if self.retention_combo.currentIndex() == 2:
+            self._save_retention_policy_from_ui()
+
+    def on_apply_retention_now(self) -> None:
+        deleted = store.apply_retention_policy()
+        self.refresh_history_table()
+        mode, count = store.get_retention_policy()
+        if mode == store.RETENTION_MODE_ALL:
+            QMessageBox.information(self, APP_TITLE, "Retention is set to \u201ckeep all runs\u201d - nothing was pruned.")
+        else:
+            QMessageBox.information(
+                self, APP_TITLE,
+                f"Applied retention (keep last {count} per job/manual bucket).\n"
+                f"Deleted {deleted} old run history row(s). Lifetime usage totals are unaffected."
+            )
+
+    def refresh_history_table(self) -> None:
+        # Repopulate the job filter combo without losing the current selection.
+        current_job_id = self.history_job_combo.currentData() if hasattr(self, "history_job_combo") else None
+        jobs_by_id = {job["job_id"]: job for job in store.list_jobs()}
+        if hasattr(self, "history_job_combo"):
+            self.history_job_combo.blockSignals(True)
+            self.history_job_combo.clear()
+            self.history_job_combo.addItem("All runs", None)
+            for job in jobs_by_id.values():
+                self.history_job_combo.addItem(job["name"], job["job_id"])
+            idx = self.history_job_combo.findData(current_job_id)
+            self.history_job_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.history_job_combo.blockSignals(False)
+            selected_job_id = self.history_job_combo.currentData()
+        else:
+            selected_job_id = None
+
+        self.history_model.removeRows(0, self.history_model.rowCount())
+        for run in store.list_run_history(job_id=selected_job_id, limit=200):
+            job_name = jobs_by_id.get(run["job_id"], {}).get("name", "Manual run") if run["job_id"] else "Manual run"
+            duration = f"{run['duration_seconds']:.1f}s"
+            mb_s = f"{run['throughput_mb_s']:.1f}" if run["throughput_mb_s"] else ""
+            acl_col = "\u2014"
+            if run["acl_chained"]:
+                try:
+                    summary = json.loads(run["acl_summary_json"]) if run["acl_summary_json"] else {}
+                    acl_col = ", ".join(f"{k}:{v}" for k, v in summary.items() if v)
+                    acl_col = acl_col or "no differences"
+                except (ValueError, TypeError):
+                    acl_col = "yes"
+            row = [
+                QStandardItem(run["start_time"]),
+                QStandardItem(job_name),
+                QStandardItem(run["source"]),
+                QStandardItem(run["dest"]),
+                QStandardItem(run["mode"]),
+                QStandardItem("Yes" if run["dry_run"] else "No"),
+                QStandardItem(duration),
+                QStandardItem(str(run["files_copied"]) if run["files_copied"] is not None else ""),
+                QStandardItem(str(run["bytes_copied"]) if run["bytes_copied"] is not None else ""),
+                QStandardItem(mb_s),
+                QStandardItem(str(run["exit_code"])),
+                QStandardItem(run["description"]),
+                QStandardItem(acl_col),
+            ]
+            if run["is_failure"]:
+                for item in row:
+                    item.setBackground(QBrush(QColor("#f8d7da")))
+                    item.setForeground(QBrush(QColor("#1a1a1a")))
+            self.history_model.appendRow(row)
+
+        total_rows = store.count_run_history()
+        mode, count = store.get_retention_policy()
+        policy_text = "keeping all runs" if mode == store.RETENTION_MODE_ALL else f"keeping last {count} per job/manual bucket"
+        shown = self.history_model.rowCount()
+        self.history_row_count_label.setText(
+            f"Showing {shown} run(s){' (limited to 200)' if shown == 200 else ''} - "
+            f"{total_rows} total in database - retention policy: {policy_text}."
+        )
+
     def _auto_fill_from_source(self, text: str) -> None:
         host = core.parse_unc_host(text)
         if host and not self._resolve_host_manual:
@@ -623,6 +1196,11 @@ class MainWindow(QMainWindow):
 
         log_path = self.sync_log_edit.text().strip() or None
 
+        self._sync_source = source
+        self._sync_dest = dest
+        self._sync_mode = "mirror" if mirror else "copy"
+        self._sync_start_time = datetime.now(timezone.utc)
+
         self.sync_log_view.clear()
         mode_label = "MIRROR" if mirror else "copy-only"
         run_label = "PREVIEW (dry run)" if dry_run else "LIVE RUN"
@@ -674,6 +1252,12 @@ class MainWindow(QMainWindow):
         self.sync_summary_label.setText(summary_text)
         self.append_sync_log(f"\n=== Done ===\n{summary_text}\nExit code: {result['exit_code']}")
 
+        self._last_manual_run_id = store.record_run(
+            result, self._sync_source, self._sync_dest, self._sync_mode, dry_run=dry_run,
+            start_time=self._sync_start_time, end_time=datetime.now(timezone.utc), job_id=None,
+        )
+        self.refresh_history_table()
+
         if robocopy_sync.is_failure(result["exit_code"]) and not result["cancelled"]:
             QMessageBox.warning(
                 self, APP_TITLE,
@@ -689,6 +1273,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
             if reply == QMessageBox.Yes:
+                self._pending_acl_chain_run_id = self._last_manual_run_id
                 self.tabs.setCurrentIndex(1)
                 self.start_scan()
 
@@ -817,6 +1402,12 @@ class MainWindow(QMainWindow):
         )
         self.summary_label.setText(summary)
         self.append_log(f"\n=== Done ===\n{summary}\nReport saved to: {self.last_output_path}")
+
+        if self._pending_acl_chain_run_id:
+            acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
+            store.update_run_acl_summary(self._pending_acl_chain_run_id, acl_summary)
+            self._pending_acl_chain_run_id = None
+            self.refresh_history_table()
 
     def scan_failed(self, message: str) -> None:
         try:

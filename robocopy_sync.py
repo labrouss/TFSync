@@ -4,7 +4,7 @@ robocopy_sync.py
 =================
 Thin wrapper around Windows' built-in robocopy for syncing/copying an
 SMB/CIFS share to another while preserving NTFS permissions. Used by both
-sync_shares.py (CLI) and compare_acls_gui.py (GUI Sync tab).
+sync_shares.py (CLI) and tfsync_gui.py (GUI Sync tab).
 
 Two modes:
   - Copy-only (default): robocopy /E - copies new/changed files and folders,

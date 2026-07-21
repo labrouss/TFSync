@@ -3,7 +3,7 @@
 acl_compare_core.py
 ====================
 Shared engine for comparing NTFS ACLs between two SMB/CIFS UNC paths.
-Used by both compare_acls.py (CLI) and compare_acls_gui.py (PyQt5 GUI).
+Used by both compare_acls.py (CLI) and tfsync_gui.py (PyQt5 GUI).
 
 Requires: Windows + pywin32 (pip install pywin32)
 """

@@ -5,7 +5,7 @@ REM               builds all executables with PyInstaller, then
 REM               the Windows installer with Inno Setup if present.
 REM
 REM  Run this from the folder containing:
-REM     acl_compare_core.py, compare_acls.py, compare_acls_gui.py,
+REM     acl_compare_core.py, compare_acls.py, tfsync_gui.py,
 REM     robocopy_sync.py, sync_shares.py, decode_mask.py
 REM
 REM  Requires: pip install pywin32 PyQt5 pyinstaller
@@ -33,18 +33,18 @@ if errorlevel 1 (
 )
 
 echo.
-echo === Building GUI: compare_acls_gui.exe ===
+echo === Building GUI: tfsync_gui.exe ===
 REM NOTE: using --console here on purpose for the first build so any
 REM startup errors are visible. Once you've confirmed it runs cleanly,
 REM re-run with --windowed instead (edit the line below) for a
 REM console-free GUI app.
-pyinstaller --onefile --console --name compare_acls_gui ^
+pyinstaller --onefile --console --name tfsync_gui ^
     --hidden-import=win32timezone ^
     --hidden-import=win32security ^
     --hidden-import=win32process ^
     --hidden-import=ntsecuritycon ^
     --hidden-import=PyQt5.sip ^
-    compare_acls_gui.py
+    tfsync_gui.py
 
 if errorlevel 1 (
     echo.
@@ -80,7 +80,7 @@ if errorlevel 1 (
 echo.
 echo === Done ===
 echo   CLI exe:          dist\compare_acls.exe
-echo   GUI exe:          dist\compare_acls_gui.exe
+echo   GUI exe:          dist\tfsync_gui.exe
 echo   Sync exe:         dist\sync_shares.exe
 echo   Mask decoder exe: dist\decode_mask.exe
 
@@ -103,7 +103,7 @@ if exist %ISCC% (
 )
 
 echo.
-echo Once you've confirmed compare_acls_gui.exe runs cleanly, you can
+echo Once you've confirmed tfsync_gui.exe runs cleanly, you can
 echo rebuild it with --windowed instead of --console to drop the
 echo console window (see comment above).
 
