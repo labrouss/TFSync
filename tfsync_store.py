@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
     last_run_id      TEXT,
-    last_run_status  TEXT                              -- mirrors run_history.description for quick display
+    last_run_status  TEXT,                              -- mirrors run_history.description for quick display
+    last_run_at      TEXT                                -- UTC timestamp of the most recent run's start, for display
 );
 
 CREATE TABLE IF NOT EXISTS run_history (
@@ -174,6 +175,8 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN source_username TEXT")
     if "dest_username" not in jobs_cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN dest_username TEXT")
+    if "last_run_at" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN last_run_at TEXT")
 
 
 # --------------------------------------------------------------------------
@@ -408,8 +411,9 @@ def record_run(
         )
         if job_id:
             conn.execute(
-                "UPDATE jobs SET last_run_id = ?, last_run_status = ?, updated_at = ? WHERE job_id = ?",
-                (run_id, result.get("description", ""), _utcnow_iso(), job_id),
+                "UPDATE jobs SET last_run_id = ?, last_run_status = ?, last_run_at = ?, updated_at = ? WHERE job_id = ?",
+                (run_id, result.get("description", ""),
+                 start_time.astimezone(timezone.utc).isoformat(timespec="seconds"), _utcnow_iso(), job_id),
             )
         if bytes_copied and not dry_run:
             conn.execute(

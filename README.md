@@ -30,6 +30,13 @@ optional auto-chained ACL verification, and an optional **Schedule**) and
 run them on demand with **Run Now** - or let them run unattended via
 Windows Task Scheduler.
 
+While a job is running (via **Run Now** in this GUI session), its row is
+highlighted green with "Running now..." in the **Last Run (local)**
+column, so it's obvious at a glance which job(s) are active. That column
+otherwise shows the local timestamp of the job's most recent run (or
+"Never run"), separate from **Last Status**, which shows that run's
+description.
+
 **Schedule** (set via a Frequency dropdown in the job editor, not raw text):
 Daily and Weekly show a time picker (Weekly also shows day checkboxes);
 Hourly, Every N hours/minutes, and Once are also available for less
@@ -180,6 +187,13 @@ waits, and everything else around the copy, understating throughput and
 not matching what the log itself reports. Falls back to a wall-clock
 estimate only when robocopy's line isn't available (e.g. a cancelled run,
 or nothing was copied).
+
+**Start Time (local)** is converted from storage to your system's local
+time zone for display, so it lines up with wall-clock time and with what
+robocopy's own log shows (e.g. "Started : ... 12:59:06 PM", which is
+local time) - internally, `tfsync_store` always stores timestamps in UTC
+(unambiguous across time zones and DST), converted to local only at
+display time.
 
 **Viewing a live log while a job runs**: the Job Queue tab's **View Live
 Log** button opens a separate, non-modal `tail -f`-style window for the

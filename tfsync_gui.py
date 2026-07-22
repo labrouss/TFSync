@@ -203,13 +203,13 @@ DIFF_TYPES = [
 ]
 
 JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
-               "Auto-Verify ACL", "Enabled", "Run As", "Last Status", "Next Run"]
+               "Auto-Verify ACL", "Enabled", "Run As", "Last Run (local)", "Last Status", "Next Run"]
 
 JOB_EXPORT_FIELDS = ["name", "source", "dest", "mode", "schedule_expr",
                       "threads", "retries", "auto_verify_acl", "enabled", "run_as_user",
                       "source_username", "dest_username"]
 
-HISTORY_COLUMNS = ["Start Time", "Job", "Source", "Destination", "Mode", "Dry Run",
+HISTORY_COLUMNS = ["Start Time (local)", "Job", "Source", "Destination", "Mode", "Dry Run",
                     "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
                     "Description", "ACL Chained"]
 
@@ -226,6 +226,25 @@ def format_bytes_human(num_bytes: Optional[int]) -> str:
             return f"{int(value)} {unit}" if unit == "B" else f"{value:.2f} {unit}"
         value /= 1024.0
     return f"{value:.2f} TB"
+
+
+def format_local_datetime(iso_str: Optional[str]) -> str:
+    """
+    Converts a stored UTC timestamp (tfsync_store.record_run always stores
+    start_time/end_time in UTC, for unambiguous storage) to the local
+    system's time zone for display - so it matches wall-clock time and
+    what robocopy's own log shows (e.g. "Started : ... 12:59:06 PM" in
+    local time), rather than showing raw UTC that's offset from both.
+    """
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return iso_str
 
 
 class ScanWorker(QThread):
@@ -1451,6 +1470,7 @@ class MainWindow(QMainWindow):
         for job in store.list_jobs():
             next_run = self._next_run_display(job)
             run_as_display = job["run_as_user"] if job.get("run_as_user") else "Interactive (you)"
+            is_running = job["job_id"] in self._active_job_runs
             row = [
                 QStandardItem(job["name"]),
                 QStandardItem(job["source"]),
@@ -1461,10 +1481,15 @@ class MainWindow(QMainWindow):
                 QStandardItem("Yes" if job["auto_verify_acl"] else "No"),
                 QStandardItem("Yes" if job["enabled"] else "No"),
                 QStandardItem(run_as_display),
+                QStandardItem("Running now..." if is_running else format_local_datetime(job.get("last_run_at")) or "Never run"),
                 QStandardItem(job["last_run_status"] or "Never run"),
                 QStandardItem(next_run),
             ]
             row[0].setData(job["job_id"], Qt.UserRole)
+            if is_running:
+                for item in row:
+                    item.setBackground(QBrush(QColor("#c8f7c5")))
+                    item.setForeground(QBrush(QColor("#1a1a1a")))
             self.jobs_model.appendRow(row)
         self._refresh_compare_job_combo()
 
@@ -2106,7 +2131,7 @@ class MainWindow(QMainWindow):
                 except (ValueError, TypeError):
                     acl_col = "yes"
             row = [
-                QStandardItem(run["start_time"]),
+                QStandardItem(format_local_datetime(run["start_time"])),
                 QStandardItem(job_name),
                 QStandardItem(run["source"]),
                 QStandardItem(run["dest"]),
