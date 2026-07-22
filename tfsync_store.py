@@ -55,6 +55,10 @@ CREATE TABLE IF NOT EXISTS jobs (
                                                           -- registered with /RU <run_as_user> /RP <password>.
                                                           -- The password itself is NEVER stored - only handed to
                                                           -- schtasks at registration time and then discarded.
+    source_username  TEXT,                              -- NULL = use whatever's already cached for that server.
+    dest_username    TEXT,                              -- Set = a cmdkey Credential Manager entry should exist for
+                                                          -- that server; passwords are NEVER stored here either -
+                                                          -- only handed to cmdkey.exe at entry time and discarded.
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
     last_run_id      TEXT,
@@ -164,6 +168,10 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
     jobs_cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     if "run_as_user" not in jobs_cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN run_as_user TEXT")
+    if "source_username" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN source_username TEXT")
+    if "dest_username" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN dest_username TEXT")
 
 
 # --------------------------------------------------------------------------
@@ -181,6 +189,8 @@ def create_job(
     auto_verify_acl: bool = False,
     enabled: bool = True,
     run_as_user: Optional[str] = None,
+    source_username: Optional[str] = None,
+    dest_username: Optional[str] = None,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> str:
     """Creates a job definition and returns its job_id."""
@@ -190,10 +200,12 @@ def create_job(
         conn.execute(
             """INSERT INTO jobs
                (job_id, name, source, dest, mode, schedule_expr, threads,
-                retries, auto_verify_acl, enabled, run_as_user, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                retries, auto_verify_acl, enabled, run_as_user, source_username,
+                dest_username, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, name, source, dest, mode, schedule_expr, threads,
-             retries, int(auto_verify_acl), int(enabled), run_as_user or None, now, now),
+             retries, int(auto_verify_acl), int(enabled), run_as_user or None,
+             source_username or None, dest_username or None, now, now),
         )
     return job_id
 

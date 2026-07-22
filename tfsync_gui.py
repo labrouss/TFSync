@@ -39,6 +39,7 @@ import acl_compare_core as core
 import robocopy_sync
 import tfsync_store as store
 import task_scheduler
+import credential_manager
 
 APP_TITLE = "TFSync — Total File Sync"
 
@@ -204,7 +205,8 @@ JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
                "Auto-Verify ACL", "Enabled", "Run As", "Last Status", "Next Run"]
 
 JOB_EXPORT_FIELDS = ["name", "source", "dest", "mode", "schedule_expr",
-                      "threads", "retries", "auto_verify_acl", "enabled", "run_as_user"]
+                      "threads", "retries", "auto_verify_acl", "enabled", "run_as_user",
+                      "source_username", "dest_username"]
 
 HISTORY_COLUMNS = ["Start Time", "Job", "Source", "Destination", "Mode", "Dry Run",
                     "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
@@ -361,6 +363,105 @@ class LiveLogViewerDialog(QDialog):
     def closeEvent(self, event) -> None:
         self._timer.stop()
         super().closeEvent(event)
+
+
+class ShareCredentialsDialog(QDialog):
+    """
+    Lightweight standalone dialog for setting source/destination
+    credentials (via Windows Credential Manager / cmdkey) for a manual
+    sync - unlike the Job Queue's job editor, there's no job record here
+    to remember a username against, so this just applies immediately and
+    reports what happened.
+    """
+
+    def __init__(self, parent, source_path: str, dest_path: str):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Share Credentials")
+        self.setMinimumWidth(480)
+        self.source_path = source_path
+        self.dest_path = dest_path
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Use this if the source and/or destination share needs different "
+            "credentials than your current Windows account - e.g. migrating "
+            "from/to a system outside your domain. This sets the credential for "
+            "your CURRENT Windows account via Credential Manager (cmdkey); "
+            "passwords are never stored by TFSync."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #999; font-style: italic;")
+        layout.addWidget(intro)
+
+        source_host = credential_manager.host_from_path(source_path)
+        dest_host = credential_manager.host_from_path(dest_path)
+
+        form = QVBoxLayout()
+        self.source_chk, self.source_user_edit, self.source_pw_edit = self._row(
+            form, f"Source ({source_host or 'not a UNC path'}):", enabled=bool(source_host)
+        )
+        self.dest_chk, self.dest_user_edit, self.dest_pw_edit = self._row(
+            form, f"Destination ({dest_host or 'not a UNC path'}):", enabled=bool(dest_host)
+        )
+        layout.addLayout(form)
+        self._source_host = source_host
+        self._dest_host = dest_host
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Apply")
+        buttons.accepted.connect(self._on_apply)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _row(self, parent_layout: QVBoxLayout, label: str, enabled: bool):
+        chk = QCheckBox(label)
+        chk.setEnabled(enabled)
+        fields = QWidget()
+        fields_row = QHBoxLayout(fields)
+        fields_row.setContentsMargins(20, 0, 0, 4)
+        fields_row.addWidget(QLabel("Username:"))
+        user_edit = QLineEdit()
+        user_edit.setPlaceholderText(r"DOMAIN\username or username@domain.com")
+        fields_row.addWidget(user_edit)
+        fields_row.addWidget(QLabel("Password:"))
+        pw_edit = QLineEdit()
+        pw_edit.setEchoMode(QLineEdit.Password)
+        fields_row.addWidget(pw_edit)
+        fields.setEnabled(False)
+        chk.toggled.connect(fields.setEnabled)
+        parent_layout.addWidget(chk)
+        parent_layout.addWidget(fields)
+        return chk, user_edit, pw_edit
+
+    def _on_apply(self) -> None:
+        applied, errors = [], []
+        for label, host, chk, user_edit, pw_edit in (
+            ("source", self._source_host, self.source_chk, self.source_user_edit, self.source_pw_edit),
+            ("destination", self._dest_host, self.dest_chk, self.dest_user_edit, self.dest_pw_edit),
+        ):
+            if not chk.isChecked():
+                continue
+            username, password = user_edit.text().strip(), pw_edit.text()
+            if not username or not password:
+                errors.append(f"{label}: username and password are both required")
+                continue
+            try:
+                credential_manager.add_credential(host, username, password)
+                applied.append(f"{label} ({host})")
+            except credential_manager.CredentialError as e:
+                errors.append(f"{label}: {e}")
+
+        if not applied and not errors:
+            self.reject()
+            return
+        msg = ""
+        if applied:
+            msg += "Applied credentials for: " + ", ".join(applied)
+        if errors:
+            msg += ("\n\n" if msg else "") + "Errors:\n" + "\n".join(errors)
+        QMessageBox.information(self, "Configure Share Credentials", msg)
+        if not errors:
+            self.accept()
 
 
 class JobEditorDialog(QDialog):
@@ -585,6 +686,41 @@ class JobEditorDialog(QDialog):
             self.runas_interactive_radio.setChecked(True)
             self.runas_stack.setCurrentIndex(0)
 
+        creds_box = QGroupBox("Share Credentials (if source/dest need a different login)")
+        creds_box_layout = QVBoxLayout()
+        creds_intro = QLabel(
+            "Leave unchecked if the account running this sync already has access "
+            "(e.g. same domain). Use this when migrating from/to a system outside "
+            "your domain, or one that needs its own login."
+        )
+        creds_intro.setWordWrap(True)
+        creds_intro.setStyleSheet("color: #999; font-style: italic;")
+        creds_box_layout.addWidget(creds_intro)
+
+        existing_source_user = job.get("source_username") if job else None
+        existing_dest_user = job.get("dest_username") if job else None
+
+        self.source_creds_chk, self.source_cred_user_edit, self.source_cred_pw_edit = self._build_share_credential_row(
+            creds_box_layout, "Source:", existing_source_user
+        )
+        self.dest_creds_chk, self.dest_cred_user_edit, self.dest_cred_pw_edit = self._build_share_credential_row(
+            creds_box_layout, "Destination:", existing_dest_user
+        )
+
+        creds_note = QLabel(
+            "Passwords here are never stored by TFSync - each is passed once to Windows "
+            "Credential Manager (cmdkey) when you save, then discarded. This sets the "
+            "credential for the CURRENT Windows account only; if this job's Run As "
+            "above uses a different account, that account needs its own credentials "
+            "set separately for scheduled runs to authenticate."
+        )
+        creds_note.setWordWrap(True)
+        creds_note.setStyleSheet("color: #999; font-style: italic;")
+        creds_box_layout.addWidget(creds_note)
+
+        creds_box.setLayout(creds_box_layout)
+        form.addRow(creds_box)
+
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 128)
         self.threads_spin.setValue(job["threads"] if job else 16)
@@ -609,6 +745,31 @@ class JobEditorDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _build_share_credential_row(self, parent_layout: QVBoxLayout, label: str, existing_username: Optional[str]):
+        chk = QCheckBox(f"{label} needs different credentials")
+        chk.setChecked(bool(existing_username))
+
+        fields = QWidget()
+        fields_row = QHBoxLayout(fields)
+        fields_row.setContentsMargins(20, 0, 0, 4)
+        fields_row.addWidget(QLabel("Username:"))
+        user_edit = QLineEdit(existing_username or "")
+        user_edit.setPlaceholderText(r"DOMAIN\username or username@domain.com")
+        fields_row.addWidget(user_edit)
+        fields_row.addWidget(QLabel("Password:"))
+        pw_edit = QLineEdit()
+        pw_edit.setEchoMode(QLineEdit.Password)
+        pw_edit.setPlaceholderText(
+            "Re-enter to (re)apply - never stored" if existing_username else "Required to set this credential"
+        )
+        fields_row.addWidget(pw_edit)
+        fields.setEnabled(bool(existing_username))
+        chk.toggled.connect(fields.setEnabled)
+
+        parent_layout.addWidget(chk)
+        parent_layout.addWidget(fields)
+        return chk, user_edit, pw_edit
 
     def _path_row(self, edit: QLineEdit) -> QWidget:
         row = QWidget()
@@ -715,6 +876,12 @@ class JobEditorDialog(QDialog):
                 )
                 if reply != QMessageBox.Yes:
                     return
+        if self.source_creds_chk.isChecked() and not self.source_cred_user_edit.text().strip():
+            QMessageBox.warning(self, "Job Queue", "Please provide a username for the source's credentials.")
+            return
+        if self.dest_creds_chk.isChecked() and not self.dest_cred_user_edit.text().strip():
+            QMessageBox.warning(self, "Job Queue", "Please provide a username for the destination's credentials.")
+            return
         try:
             self._pending_schedule_expr = self._build_schedule_expr()
         except task_scheduler.ScheduleParseError as e:
@@ -731,6 +898,20 @@ class JobEditorDialog(QDialog):
             return self.runas_password_edit.text() or None
         return None
 
+    def get_source_credentials(self) -> Optional["tuple[str, str]"]:
+        """Returns (username, password) for the source share if configured and a
+        password was entered this time, else None. Never persisted - callers
+        must apply it immediately (e.g. cmdkey) and then discard it."""
+        if self.source_creds_chk.isChecked() and self.source_cred_pw_edit.text():
+            return self.source_cred_user_edit.text().strip(), self.source_cred_pw_edit.text()
+        return None
+
+    def get_dest_credentials(self) -> Optional["tuple[str, str]"]:
+        """Same as get_source_credentials(), for the destination share."""
+        if self.dest_creds_chk.isChecked() and self.dest_cred_pw_edit.text():
+            return self.dest_cred_user_edit.text().strip(), self.dest_cred_pw_edit.text()
+        return None
+
     def values(self) -> dict:
         return {
             "name": self.name_edit.text().strip(),
@@ -743,6 +924,8 @@ class JobEditorDialog(QDialog):
             "auto_verify_acl": self.auto_verify_chk.isChecked(),
             "enabled": self.enabled_chk.isChecked(),
             "run_as_user": self.runas_user_edit.text().strip() if self.runas_stored_radio.isChecked() else None,
+            "source_username": self.source_cred_user_edit.text().strip() if self.source_creds_chk.isChecked() else None,
+            "dest_username": self.dest_cred_user_edit.text().strip() if self.dest_creds_chk.isChecked() else None,
         }
 
 
@@ -898,10 +1081,17 @@ class MainWindow(QMainWindow):
             "so this sync can repeat on a schedule."
         )
         self.schedule_resync_btn.clicked.connect(self.on_schedule_resync)
+        self.configure_creds_btn = QPushButton("Configure Credentials...")
+        self.configure_creds_btn.setToolTip(
+            "Set different Windows credentials for the source and/or destination share "
+            "(e.g. migrating from/to a system outside your domain)."
+        )
+        self.configure_creds_btn.clicked.connect(self.on_configure_share_credentials)
         controls.addWidget(self.preview_btn)
         controls.addWidget(self.run_sync_btn)
         controls.addWidget(self.cancel_sync_btn)
         controls.addWidget(self.schedule_resync_btn)
+        controls.addWidget(self.configure_creds_btn)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -954,10 +1144,25 @@ class MainWindow(QMainWindow):
         }
         dialog = JobEditorDialog(self, job=seed, window_title="Schedule a Resync")
         if dialog.exec_() == QDialog.Accepted:
-            job_id = store.create_job(**dialog.values())
+            values = dialog.values()
+            password = dialog.get_entered_password()
+            self._apply_share_credentials(dialog, values)
+            job_id = store.create_job(**values)
             self.refresh_jobs_table()
-            self._sync_job_schedule(job_id)
+            self._sync_job_schedule(job_id, password=password)
             self.tabs.setCurrentIndex(2)  # Job Queue tab
+
+    def on_configure_share_credentials(self) -> None:
+        if os.name != "nt":
+            QMessageBox.information(self, APP_TITLE, "Credential management requires Windows (cmdkey.exe).")
+            return
+        source = self.source_edit.text().strip()
+        dest = self.dest_edit.text().strip()
+        if not source or not dest:
+            QMessageBox.information(self, APP_TITLE, "Enter a source and destination first.")
+            return
+        dialog = ShareCredentialsDialog(self, source, dest)
+        dialog.exec_()
 
     # -------------------------------------------------------- Compare tab --
     def _build_compare_tab(self) -> QWidget:
@@ -1281,6 +1486,7 @@ class MainWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             values = dialog.values()
             password = dialog.get_entered_password()
+            self._apply_share_credentials(dialog, values)
             job_id = store.create_job(**values)
             self.refresh_jobs_table()
             self._sync_job_schedule(job_id, password=password)
@@ -1294,7 +1500,9 @@ class MainWindow(QMainWindow):
         dialog = JobEditorDialog(self, job=job)
         if dialog.exec_() == QDialog.Accepted:
             password = dialog.get_entered_password()
-            store.update_job(job_id, **dialog.values())
+            values = dialog.values()
+            self._apply_share_credentials(dialog, values)
+            store.update_job(job_id, **values)
             self.refresh_jobs_table()
             self._sync_job_schedule(job_id, password=password)
 
@@ -1311,9 +1519,37 @@ class MainWindow(QMainWindow):
         dialog = JobEditorDialog(self, job=clone_seed, window_title="Clone Job")
         if dialog.exec_() == QDialog.Accepted:
             password = dialog.get_entered_password()
-            new_job_id = store.create_job(**dialog.values())
+            values = dialog.values()
+            self._apply_share_credentials(dialog, values)
+            new_job_id = store.create_job(**values)
             self.refresh_jobs_table()
             self._sync_job_schedule(new_job_id, password=password)
+
+    def _apply_share_credentials(self, dialog: "JobEditorDialog", values: dict) -> None:
+        """Applies any source/destination credentials entered in the job editor
+        via Windows Credential Manager (cmdkey), under the CURRENT Windows
+        account. No-op on non-Windows or if neither was configured this time."""
+        if os.name != "nt":
+            return
+        for label, path_key, creds in (
+            ("source", "source", dialog.get_source_credentials()),
+            ("destination", "dest", dialog.get_dest_credentials()),
+        ):
+            if not creds:
+                continue
+            username, password = creds
+            host = credential_manager.host_from_path(values[path_key])
+            if not host:
+                QMessageBox.warning(
+                    self, APP_TITLE,
+                    f"Could not determine a server address from the {label} path to "
+                    f"attach credentials to - they were not set."
+                )
+                continue
+            try:
+                credential_manager.add_credential(host, username, password)
+            except credential_manager.CredentialError as e:
+                QMessageBox.warning(self, APP_TITLE, f"Could not set {label} credentials:\n{e}")
 
     def _sync_job_schedule(self, job_id: str, password: Optional[str] = None) -> None:
         """
@@ -1471,12 +1707,16 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             raise ValueError("threads/retries must be numbers")
         run_as_user = str(entry.get("run_as_user") or "").strip() or None
+        source_username = str(entry.get("source_username") or "").strip() or None
+        dest_username = str(entry.get("dest_username") or "").strip() or None
         return {
             "name": name, "source": source, "dest": dest, "mode": mode,
             "schedule_expr": schedule_expr, "threads": threads, "retries": retries,
             "auto_verify_acl": bool(entry.get("auto_verify_acl", False)),
             "enabled": bool(entry.get("enabled", True)),
             "run_as_user": run_as_user,
+            "source_username": source_username,
+            "dest_username": dest_username,
         }
 
     def on_import_jobs(self) -> None:
@@ -1508,6 +1748,7 @@ class MainWindow(QMainWindow):
             return
 
         needs_password = [job["name"] for job in valid if job.get("run_as_user")]
+        needs_share_creds = [job["name"] for job in valid if job.get("source_username") or job.get("dest_username")]
         msg = f"Import {len(valid)} job(s) as new entries?"
         if errors:
             msg += f"\n\n{len(errors)} entry/entries will be skipped:\n" + "\n".join(errors)
@@ -1516,6 +1757,10 @@ class MainWindow(QMainWindow):
                     f"not and will need their password re-entered afterward (Edit Job, or "
                     f"\u201cSync Schedules Now\u201d) - passwords are never included in exports:\n"
                     + "\n".join(needs_password))
+        if needs_share_creds:
+            msg += (f"\n\n{len(needs_share_creds)} job(s) reference source/destination "
+                    f"credentials that will need re-entering (Edit Job) - passwords are "
+                    f"never included in exports either:\n" + "\n".join(needs_share_creds))
         reply = QMessageBox.question(self, APP_TITLE, msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return

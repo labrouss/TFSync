@@ -93,6 +93,30 @@ you only ever run manually.
   `cmdkey /add:<server> /user:<account> /pass:<password>` under the same
   Windows account the task runs as - either works.)
 
+**Share Credentials** (`credential_manager.py`): separate from Run As
+(which is *who runs the task*), this is for when the **source and/or
+destination share itself** needs a different login than whichever
+account is doing the syncing - the common case when migrating from/to a
+system outside your domain. In the job editor (and via **Configure
+Credentials...** on the Sync tab, for one-off manual syncs with no job
+record), check "needs different credentials" for source and/or
+destination and provide a username + password.
+- This calls `cmdkey /add:<server> /user:<username> /pass:<password>`
+  once, immediately, under the account currently running TFSync -
+  **the password is never stored by TFSync**, only the username (so the
+  job/export can show what's configured). The credential itself lives in
+  Windows' own encrypted Credential Manager store from then on.
+- **Important scope limitation**: this sets the credential for the
+  *current* Windows account. If a job's Run As is set to a *different*
+  stored-credential account, that account needs its own `cmdkey` entry -
+  TFSync running as you can't reach into another account's Credential
+  Manager store. The dialog says this explicitly rather than silently
+  doing the wrong thing.
+- Windows can only hold one credential per server name per account at a
+  time - this is a Windows/SMB limitation, not something TFSync can work
+  around. It's not an issue as long as source and destination are
+  different server names, which is the normal case.
+
 A few other notes on how the queue behaves:
 
 - **Max concurrent jobs** (default 2) is an actual cap - "Run Now" is
@@ -214,6 +238,7 @@ That means:
 | `tfsync_gui.py` (GUI) | ✅ Full functionality | ❌ Shows a clear error dialog |
 | `run_scheduled_job.py` (Task Scheduler runner) | ✅ Full functionality | ❌ Exits with a clear error |
 | `task_scheduler.py` (scheduling integration) | ✅ Registers/queries real tasks | ⚠️ Schedule *parsing/validation* works everywhere; actually registering a task requires `schtasks.exe` (Windows only) |
+| `credential_manager.py` (share credentials) | ✅ Full functionality | ⚠️ `host_from_path()` parsing works everywhere; actually setting a credential requires `cmdkey.exe` (Windows only) |
 | `decode_mask.py` (mask decoder) | ✅ | ✅ Pure Python, works everywhere |
 
 The GitHub Actions workflow reflects this: it builds full Windows executables
@@ -270,6 +295,7 @@ decode_mask.py                         Standalone access-mask decoder (cross-pla
 tfsync_store.py                        SQLite job/run-history store + LicenseManager/UsageTracker stubs (cross-platform, no Windows deps)
 task_scheduler.py                      Schedule expression parsing (cross-platform) + schtasks.exe wrapper (Windows only)
 run_scheduled_job.py                   Headless entry point Task Scheduler invokes to actually run one job
+credential_manager.py                  Source/dest share credentials via Windows Credential Manager (cmdkey.exe wrapper, Windows only)
 requirements.txt                       Python dependencies
 build.bat                              Local Windows build script (PyInstaller + installer)
 installer/compare_acls_installer.iss   Inno Setup script for the Windows installer
