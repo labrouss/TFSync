@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QDir, QTime, QDate, QDateTime
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QDir, QTime, QDate, QDateTime, QTimer
 from PyQt5.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPalette
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -287,6 +287,80 @@ class SyncWorker(QThread):
             self.finished_ok.emit(result)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class LiveLogViewerDialog(QDialog):
+    """
+    A non-modal 'tail -f' style viewer: polls a log file for new content
+    every 500ms and appends it, auto-scrolling by default. Works for any
+    log file, whether it's being written by a job running right now in
+    this GUI session (Run Now) or by an external Task Scheduler-triggered
+    run - either way, it's just reading whatever robocopy is appending to
+    the file, so nothing else needs to know this window exists.
+    """
+
+    def __init__(self, parent, title: str, log_path: str):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.NonModal)
+        self.resize(820, 520)
+        self.log_path = log_path
+        self._position = 0
+
+        layout = QVBoxLayout(self)
+        info_row = QHBoxLayout()
+        path_label = QLabel(f"Tailing: {log_path}")
+        path_label.setStyleSheet("color: #999;")
+        info_row.addWidget(path_label, 1)
+        self.follow_chk = QCheckBox("Follow (auto-scroll)")
+        self.follow_chk.setChecked(True)
+        info_row.addWidget(self.follow_chk)
+        layout.addLayout(info_row)
+
+        self.text_view = QPlainTextEdit()
+        self.text_view.setReadOnly(True)
+        self.text_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.text_view.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 10pt;")
+        layout.addWidget(self.text_view, 1)
+
+        btn_row = QHBoxLayout()
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("color: #999; font-style: italic;")
+        btn_row.addWidget(self.status_label)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start()
+        self._poll()
+
+    def _poll(self) -> None:
+        if not self.log_path or not os.path.isfile(self.log_path):
+            self.status_label.setText("Waiting for log file to appear...")
+            return
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._position)
+                new_data = f.read()
+                self._position = f.tell()
+        except OSError as e:
+            self.status_label.setText(f"Could not read log: {e}")
+            return
+        if new_data:
+            self.text_view.appendPlainText(new_data.rstrip("\n"))
+            if self.follow_chk.isChecked():
+                scrollbar = self.text_view.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+        self.status_label.setText(f"Live - last updated {datetime.now().strftime('%H:%M:%S')}")
+
+    def closeEvent(self, event) -> None:
+        self._timer.stop()
+        super().closeEvent(event)
 
 
 class JobEditorDialog(QDialog):
@@ -1079,6 +1153,12 @@ class MainWindow(QMainWindow):
         delete_btn.clicked.connect(self.on_delete_job)
         run_btn = QPushButton("Run Now")
         run_btn.clicked.connect(self.on_run_job_now)
+        live_log_btn = QPushButton("View Live Log")
+        live_log_btn.setToolTip(
+            "Tail this job's log in a separate window, like tail -f - works while it's "
+            "running (Run Now or a scheduled run) or just after, for its most recent run."
+        )
+        live_log_btn.clicked.connect(self.on_view_live_log)
         compare_btn = QPushButton("Compare...")
         compare_btn.setToolTip("Open the Compare ACLs tab with this job's source/dest/threads filled in")
         compare_btn.clicked.connect(self.on_compare_job)
@@ -1101,6 +1181,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(clone_btn)
         controls.addWidget(delete_btn)
         controls.addWidget(run_btn)
+        controls.addWidget(live_log_btn)
         controls.addWidget(compare_btn)
         controls.addWidget(sync_schedules_btn)
         controls.addWidget(export_jobs_btn)
@@ -1445,6 +1526,46 @@ class MainWindow(QMainWindow):
             self._sync_job_schedule(job_id)  # registers Task Scheduler tasks where applicable; no-op off Windows
 
         QMessageBox.information(self, APP_TITLE, f"Imported {len(created_ids)} job(s).")
+
+    def on_view_live_log(self) -> None:
+        job_id = self._selected_job_id()
+        if not job_id:
+            QMessageBox.information(self, APP_TITLE, "Select a job first.")
+            return
+        job = store.get_job(job_id)
+        if not job:
+            return
+
+        log_path = None
+        active_entry = self._active_job_runs.get(job_id)
+        if active_entry:
+            log_path = active_entry.get("log_path")
+
+        if not log_path:
+            # Not running in this GUI session right now (or it's a scheduled run
+            # triggered externally by Task Scheduler) - fall back to the most
+            # recently modified log file for this job, which is still "live" if
+            # a scheduled run is currently writing to it.
+            log_dir = os.path.join(os.getcwd(), "job_logs")
+            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
+            if os.path.isdir(log_dir):
+                candidates = [
+                    os.path.join(log_dir, f) for f in os.listdir(log_dir)
+                    if f.startswith(safe_name + "_") and f.endswith(".log")
+                ]
+                if candidates:
+                    log_path = max(candidates, key=os.path.getmtime)
+
+        if not log_path or not os.path.isfile(log_path):
+            QMessageBox.information(
+                self, APP_TITLE,
+                "No log file found for this job yet. Run it first (Run Now, or wait for "
+                "its schedule to fire), then try again."
+            )
+            return
+
+        dialog = LiveLogViewerDialog(self, f"Live Log \u2014 {job['name']}", log_path)
+        dialog.show()
 
     def on_run_job_now(self) -> None:
         job_id = self._selected_job_id()

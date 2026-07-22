@@ -25,6 +25,7 @@ Task Scheduler integration layer when scheduled jobs run unattended.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -260,14 +261,45 @@ def list_jobs(db_path: Path = DEFAULT_DB_PATH, enabled_only: bool = False) -> Li
 # --------------------------------------------------------------------------
 
 def _summary_int(summary: Dict[str, Dict[str, str]], row: str, col: str) -> Optional[int]:
-    """Pulls one cell out of robocopy_sync.parse_summary()'s nested dict, as an int."""
+    """Pulls one cell out of robocopy_sync.parse_summary()'s nested dict, as a
+    plain int. Only correct for the Dirs/Files rows, which are always plain
+    counts - use _summary_bytes for the Bytes row, which can carry a unit
+    suffix (k/m/g/t) once the transfer is large enough."""
     try:
         raw = summary[row][col]
-        # robocopy sometimes reports byte counts with a unit suffix (k/m/g); keep it simple
-        # and only parse plain integers here - callers can fall back to raw_summary_json.
         return int(raw)
     except (KeyError, ValueError, TypeError):
         return None
+
+
+_BYTES_VALUE_RE = re.compile(r"^([\d.,]+)\s*([kmgtKMGT])?$")
+_BYTES_UNIT_MULTIPLIERS = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+
+
+def _summary_bytes(summary: Dict[str, Dict[str, str]], col: str) -> Optional[int]:
+    """
+    Pulls a cell from the Bytes row and returns a raw byte count. robocopy
+    reports this as a plain integer for small transfers (e.g. '48291') but
+    switches to a unit-suffixed value once it's large enough (e.g.
+    '1011.52 m' for megabytes, seen once transfers get into the hundreds
+    of MB/GB range) - this handles both, rather than silently dropping the
+    unit-suffixed form the way a plain int() parse would.
+    """
+    try:
+        raw = summary["Bytes"][col].strip()
+    except (KeyError, TypeError, AttributeError):
+        return None
+    match = _BYTES_VALUE_RE.match(raw)
+    if not match:
+        return None
+    try:
+        number = float(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    multiplier = _BYTES_UNIT_MULTIPLIERS.get((match.group(2) or "").lower())
+    if multiplier is None:
+        return None
+    return int(round(number * multiplier))
 
 
 def record_run(
@@ -308,7 +340,7 @@ def record_run(
     files_skipped = _summary_int(summary, "Files", "skipped")
     files_failed = _summary_int(summary, "Files", "failed")
     files_extras = _summary_int(summary, "Files", "extras")
-    bytes_copied = _summary_int(summary, "Bytes", "copied")
+    bytes_copied = _summary_bytes(summary, "copied")
 
     throughput_mb_s = None
     throughput_files_s = None

@@ -141,6 +141,22 @@ bytes copied, derived MB/s and seconds-per-GB, exit code + description,
 and any chained ACL comparison summary. Filter by job (or "All runs") and
 hit Refresh to pull the latest. Failed runs are highlighted in red.
 
+Bytes-copied parsing handles both of robocopy's summary formats: a plain
+byte count for small transfers (`48291`) and a unit-suffixed value once
+the transfer is large enough (`1011.52 m` for megabytes, `2.3 g` for
+gigabytes, etc.) - both convert correctly to Bytes Copied and MB/s in the
+history table rather than the unit-suffixed form being silently dropped.
+
+**Viewing a live log while a job runs**: the Job Queue tab's **View Live
+Log** button opens a separate, non-modal `tail -f`-style window for the
+selected job - it polls the log file for new content every half-second
+and auto-scrolls (toggle "Follow" to stop/resume that). Works whether the
+job is currently running via "Run Now" in this GUI session, or was
+triggered by Task Scheduler in the background (it falls back to the most
+recently modified log file for that job in `job_logs/` when it isn't one
+TFSync is actively tracking itself). You can open more than one at once
+and keep working in the main window while they update.
+
 **Viewing a run's log or ACL report**: every run (manual, "Run Now", or
 scheduled) writes its own robocopy log file - each run gets a unique log
 named after its own run ID (under `job_logs/` for Job Queue runs, or
