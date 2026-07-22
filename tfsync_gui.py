@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (
     QTableView, QFileDialog, QMessageBox, QGroupBox, QComboBox, QHeaderView,
     QSplitter, QStyleFactory, QSpinBox, QTabWidget, QRadioButton, QButtonGroup,
     QDialog, QDialogButtonBox, QAbstractItemView, QTimeEdit, QDateTimeEdit, QStackedWidget, QInputDialog,
+    QScrollArea, QFrame,
 )
 
 import acl_compare_core as core
@@ -466,12 +467,12 @@ class ShareCredentialsDialog(QDialog):
 
 class JobEditorDialog(QDialog):
     """
-    Create/edit a job definition. Schedule expression is free-text for now
-    ("daily@02:00", "weekly:Sat@03:30", etc.) - the Task Scheduler
-    integration layer that actually parses this and registers a real
-    scheduled task is a separate piece of work, not yet built. Saving a
-    job here only stores the definition; it does not (yet) register
-    anything with Windows Task Scheduler.
+    Create/edit a job definition: source/dest paths, sync mode, an optional
+    schedule (registered as a real Windows Task Scheduler task - see
+    task_scheduler.py), Run As identity, and per-share credentials (see
+    credential_manager.py). Scrollable, since all of that adds up to more
+    than fits most screens at once - only the OK/Cancel buttons stay fixed
+    at the bottom.
     """
 
     def __init__(self, parent=None, job: dict = None, window_title: str = None):
@@ -482,7 +483,14 @@ class JobEditorDialog(QDialog):
         self.setMinimumWidth(480)
 
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        form_container = QWidget()
+        form = QFormLayout(form_container)
+        scroll_area.setWidget(form_container)
+        layout.addWidget(scroll_area, 1)
 
         self.name_edit = QLineEdit(job["name"] if job else "")
         self.name_edit.setPlaceholderText("e.g. Nightly finance share sync")
@@ -739,7 +747,11 @@ class JobEditorDialog(QDialog):
         self.enabled_chk.setChecked(bool(job["enabled"]) if job else True)
         form.addRow("", self.enabled_chk)
 
-        layout.addLayout(form)
+        # Cap the dialog to a sensible size relative to the screen, rather than
+        # letting it grow to fit every section (Schedule, Run As, Share
+        # Credentials, etc.) - the scroll area above absorbs the overflow.
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(560, min(720, int(screen.height() * 0.85)))
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._on_accept)
