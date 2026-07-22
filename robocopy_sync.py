@@ -112,6 +112,31 @@ def parse_summary(lines: List[str]) -> Dict[str, Dict[str, str]]:
     return summary
 
 
+_SPEED_BYTES_PER_SEC_RE = re.compile(r"^\s*Speed\s*:\s*([\d,]+)\s*Bytes/sec\.?\s*$", re.IGNORECASE)
+
+
+def parse_speed_bytes_per_sec(lines: List[str]) -> Optional[float]:
+    """
+    Parses robocopy's own 'Speed : NNN,NNN Bytes/sec.' summary line, which
+    reflects robocopy's internal measurement of actual copy throughput -
+    based on the time spent copying, not overall wall-clock time (which
+    also includes directory scanning, retries/waits, and everything else
+    around the copy itself). Prefer this over a duration-derived figure
+    whenever it's available, since it's what robocopy itself reports and
+    what a person reading the log directly would expect to match. Returns
+    None if no such line is found (e.g. nothing was copied, or the run was
+    cancelled before robocopy printed its summary).
+    """
+    for line in lines:
+        match = _SPEED_BYTES_PER_SEC_RE.match(line)
+        if match:
+            try:
+                return float(match.group(1).replace(",", ""))
+            except ValueError:
+                return None
+    return None
+
+
 def run_robocopy(
     source: str,
     dest: str,

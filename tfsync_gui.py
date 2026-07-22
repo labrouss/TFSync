@@ -214,6 +214,20 @@ HISTORY_COLUMNS = ["Start Time", "Job", "Source", "Destination", "Mode", "Dry Ru
                     "Description", "ACL Chained"]
 
 
+def format_bytes_human(num_bytes: Optional[int]) -> str:
+    """Formats a byte count as an auto-scaled human-readable size (KB/MB/GB/TB),
+    matching the binary (1024-based) units used elsewhere for MB/s and
+    seconds-per-GB, rather than showing a raw byte count."""
+    if num_bytes is None:
+        return ""
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(value) < 1024.0:
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{value:.2f} TB"
+
+
 class ScanWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int)
@@ -2100,7 +2114,7 @@ class MainWindow(QMainWindow):
                 QStandardItem("Yes" if run["dry_run"] else "No"),
                 QStandardItem(duration),
                 QStandardItem(str(run["files_copied"]) if run["files_copied"] is not None else ""),
-                QStandardItem(str(run["bytes_copied"]) if run["bytes_copied"] is not None else ""),
+                QStandardItem(format_bytes_human(run["bytes_copied"])),
                 QStandardItem(mb_s),
                 QStandardItem(str(run["exit_code"])),
                 QStandardItem(run["description"]),

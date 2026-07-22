@@ -165,11 +165,21 @@ bytes copied, derived MB/s and seconds-per-GB, exit code + description,
 and any chained ACL comparison summary. Filter by job (or "All runs") and
 hit Refresh to pull the latest. Failed runs are highlighted in red.
 
-Bytes-copied parsing handles both of robocopy's summary formats: a plain
-byte count for small transfers (`48291`) and a unit-suffixed value once
-the transfer is large enough (`1011.52 m` for megabytes, `2.3 g` for
-gigabytes, etc.) - both convert correctly to Bytes Copied and MB/s in the
-history table rather than the unit-suffixed form being silently dropped.
+**Bytes Copied** is shown auto-scaled to a human-readable unit (B/KB/MB/GB/TB,
+binary/1024-based) rather than a raw byte count. Parsing handles both of
+robocopy's summary formats under the hood: a plain byte count for small
+transfers (`48291`) and a unit-suffixed value once the transfer is large
+enough (`1011.52 m` for megabytes, `2.3 g` for gigabytes, etc.) - both
+convert correctly rather than the unit-suffixed form being silently dropped.
+
+**MB/s** is taken from robocopy's own `Speed : N Bytes/sec.` summary line
+when it's present, rather than derived from TFSync's own start/end
+timestamps. Robocopy's figure reflects only the actual time spent copying;
+a wall-clock-based figure would also include directory scanning, retries/
+waits, and everything else around the copy, understating throughput and
+not matching what the log itself reports. Falls back to a wall-clock
+estimate only when robocopy's line isn't available (e.g. a cancelled run,
+or nothing was copied).
 
 **Viewing a live log while a job runs**: the Job Queue tab's **View Live
 Log** button opens a separate, non-modal `tail -f`-style window for the

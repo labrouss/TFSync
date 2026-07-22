@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
+import robocopy_sync
+
 DEFAULT_DB_PATH = Path.home() / "AppData" / "Local" / "TFSync" / "tfsync.db"
 
 FREE_TIER_LIFETIME_BYTES = 100 * (1024 ** 3)  # 100 GB, lifetime cap
@@ -357,14 +359,26 @@ def record_run(
     throughput_mb_s = None
     throughput_files_s = None
     seconds_per_gb = None
-    if duration > 0:
-        if bytes_copied:
-            throughput_mb_s = (bytes_copied / (1024 ** 2)) / duration
-            gb_copied = bytes_copied / (1024 ** 3)
-            if gb_copied > 0:
-                seconds_per_gb = duration / gb_copied
-        if files_copied:
-            throughput_files_s = files_copied / duration
+
+    # robocopy's own "Speed : N Bytes/sec." line reflects its internal measurement
+    # of actual copy throughput - it excludes directory scanning, retries/waits,
+    # and everything else around the copy itself, so it's usually noticeably
+    # higher (and more "expected" to someone reading the log) than a figure
+    # derived from our own wall-clock start/end timestamps. Prefer it whenever
+    # it's present; fall back to the wall-clock estimate only when it isn't
+    # (e.g. a cancelled run, or nothing was copied).
+    robocopy_bytes_per_sec = robocopy_sync.parse_speed_bytes_per_sec(result.get("log_lines", []))
+    if robocopy_bytes_per_sec:
+        throughput_mb_s = robocopy_bytes_per_sec / (1024 ** 2)
+        seconds_per_gb = (1024 ** 3) / robocopy_bytes_per_sec
+    elif duration > 0 and bytes_copied:
+        throughput_mb_s = (bytes_copied / (1024 ** 2)) / duration
+        gb_copied = bytes_copied / (1024 ** 3)
+        if gb_copied > 0:
+            seconds_per_gb = duration / gb_copied
+
+    if duration > 0 and files_copied:
+        throughput_files_s = files_copied / duration
 
     exit_code = int(result.get("exit_code", -1))
     is_fail = bool(result.get("cancelled")) or exit_code >= 8  # matches robocopy_sync.is_failure convention
