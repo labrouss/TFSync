@@ -480,7 +480,7 @@ class JobEditorDialog(QDialog):
         self.job = job
         self._pending_schedule_expr: Optional[str] = None
         self.setWindowTitle(window_title or ("Edit Job" if job else "New Job"))
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(640)
 
         layout = QVBoxLayout(self)
 
@@ -747,11 +747,12 @@ class JobEditorDialog(QDialog):
         self.enabled_chk.setChecked(bool(job["enabled"]) if job else True)
         form.addRow("", self.enabled_chk)
 
-        # Cap the dialog to a sensible size relative to the screen, rather than
-        # letting it grow to fit every section (Schedule, Run As, Share
-        # Credentials, etc.) - the scroll area above absorbs the overflow.
+        # Size the dialog to fill its contents comfortably - wide enough that rows
+        # like the schedule picker and share-credential fields aren't cramped -
+        # while still capping against the screen so it never exceeds it. Height
+        # still relies on the scroll area above for anything that doesn't fit.
         screen = QApplication.primaryScreen().availableGeometry()
-        self.resize(560, min(720, int(screen.height() * 0.85)))
+        self.resize(min(720, int(screen.width() * 0.9)), min(720, int(screen.height() * 0.85)))
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._on_accept)
