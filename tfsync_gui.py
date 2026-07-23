@@ -682,7 +682,7 @@ class JobEditorDialog(QDialog):
         self.runas_user_edit.setPlaceholderText(r"DOMAIN\username or username@domain.com")
         self.runas_user_edit.setToolTip(
             "The Windows account this task logs on as - NOT the file server's address.\n"
-            r"e.g. HPEHELLAS-DEMO\svc_account or svc_account@hpehellas-demo.com" + "\n\n"
+            r"e.g. CONTOSO\svc_account or svc_account@contoso.com" + "\n\n"
             "It should already have access to the source/destination shares, the same "
             "way your own account does when you run a sync manually."
         )
@@ -1583,6 +1583,11 @@ class MainWindow(QMainWindow):
         account. No-op on non-Windows or if neither was configured this time."""
         if os.name != "nt":
             return
+
+        run_as_user = (values.get("run_as_user") or "").strip()
+        current_user = task_scheduler._current_user()
+        mismatched_run_as = bool(run_as_user) and run_as_user.lower() != current_user.lower()
+
         for label, path_key, creds in (
             ("source", "source", dialog.get_source_credentials()),
             ("destination", "dest", dialog.get_dest_credentials()),
@@ -1602,6 +1607,20 @@ class MainWindow(QMainWindow):
                 credential_manager.add_credential(host, username, password)
             except credential_manager.CredentialError as e:
                 QMessageBox.warning(self, APP_TITLE, f"Could not set {label} credentials:\n{e}")
+                continue
+
+            if mismatched_run_as:
+                QMessageBox.warning(
+                    self, APP_TITLE,
+                    f"{label.capitalize()} credentials were just set for YOUR current Windows "
+                    f"account ({current_user}) - but this job's Run As is configured to "
+                    f"execute as \u201c{run_as_user}\u201d, a different account.\n\n"
+                    f"Scheduled runs won't see this credential, and will still fail with "
+                    f"\u201cThe user name or password is incorrect\u201d.\n\n"
+                    f"To fix: open a command prompt AS {run_as_user} (e.g. via \u201cRun as "
+                    f"different user\u201d, or a session logged on as that account) and run:\n\n"
+                    f"cmdkey /add:{host} /user:{username} /pass:<password>"
+                )
 
     def _sync_job_schedule(self, job_id: str, password: Optional[str] = None) -> None:
         """
