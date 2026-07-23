@@ -212,9 +212,10 @@ wherever you point "Log file" on the Sync tab for manual ones), so one
 run's log never overwrites another's. Select a row and use:
 - **View Log** - opens that run's robocopy log with your system's default
   text viewer.
-- **View ACL Report** - opens that run's chained ACL comparison CSV, if
-  one was run (job auto-verify, or accepting the "run comparison now?"
-  prompt after a manual sync).
+- **View ACL Report** - opens that run's chained ACL comparison in the
+  same interactive, sortable/filterable table described above (with a
+  View Raw CSV option inside), if one was run (job auto-verify, or
+  accepting the "run comparison now?" prompt after a manual sync).
 
 Both tell you plainly if there's nothing to open (no log path recorded,
 the file's gone, or no ACL comparison was chained to that particular run).
@@ -452,10 +453,16 @@ RelativePath, ItemType, DifferenceType, Detail, SourceValue, DestValue
 - `MATCH` - no differences found (only present with `--show-matches` /
   "Include matching items")
 
-In the GUI, once a comparison finishes, **View CSV** opens the report file
-directly in your system's default CSV application (e.g. Excel), and
-**Open Report Folder** opens the containing folder instead - both use the
-report path currently shown in "Output CSV".
+In the GUI, once a comparison finishes, **View CSV** opens the report in
+an interactive, sortable table - the same browsing experience as watching
+a comparison run live, with a free-text filter and (since the report has
+a `DifferenceType` column) a difference-type filter, and freely resizable
+columns. A **View Raw CSV** button inside that window still opens the
+file itself with your system's default app (e.g. Excel) if you want that
+instead. **Open Report Folder** opens the containing folder rather than
+the file - both use the report path currently shown in "Output CSV". The
+Run History tab's **View ACL Report** button (see below) opens a chained
+comparison's report the same way.
 
 ## Known limitations
 

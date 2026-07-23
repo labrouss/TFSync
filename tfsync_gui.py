@@ -19,6 +19,7 @@ USAGE
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -337,6 +338,143 @@ class SyncWorker(QThread):
             self.finished_ok.emit(result)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class CsvTableViewerDialog(QDialog):
+    """
+    Opens a CSV report (ACL comparison output, from either the Compare ACLs
+    tab or a chained/scheduled job's report) in an interactive table -
+    sortable, freely resizable columns, a free-text filter, and (if the
+    CSV has a DifferenceType column, as ACL comparison reports do) a
+    difference-type filter - the same browsing experience as running a
+    comparison interactively, just for a report that's already on disk.
+    A "View Raw CSV" button is still available for opening the file
+    itself with the system's default app, same as before.
+    """
+
+    def __init__(self, parent, title: str, csv_path: str):
+        super().__init__(parent)
+        self._parent_window = parent
+        self.csv_path = csv_path
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.NonModal)
+
+        layout = QVBoxLayout(self)
+
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+        except OSError as e:
+            QMessageBox.warning(parent, title, f"Could not read this report:\n{e}")
+            self.reject()
+            return
+
+        if not rows:
+            QMessageBox.information(parent, title, "This report is empty.")
+            self.reject()
+            return
+
+        header, data_rows = rows[0], rows[1:]
+
+        path_label = QLabel(csv_path)
+        path_label.setStyleSheet("color: #999;")
+        path_label.setToolTip(csv_path)
+        layout.addWidget(path_label)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Type to filter by path, trustee, detail...")
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self.filter_edit, 1)
+
+        self.type_combo = None
+        diff_type_col = header.index("DifferenceType") if "DifferenceType" in header else None
+        if diff_type_col is not None:
+            filter_row.addWidget(QLabel("Difference type:"))
+            self.type_combo = QComboBox()
+            distinct_types = sorted({row[diff_type_col] for row in data_rows if len(row) > diff_type_col})
+            self.type_combo.addItems(["All"] + distinct_types)
+            self.type_combo.currentTextChanged.connect(self._apply_filter)
+            filter_row.addWidget(self.type_combo)
+        layout.addLayout(filter_row)
+
+        self.model = QStandardItemModel(0, len(header))
+        self.model.setHorizontalHeaderLabels(header)
+        for row in data_rows:
+            items = [QStandardItem(str(cell)) for cell in row]
+            _apply_cell_tooltips(items)
+            self.model.appendRow(items)
+
+        self.proxy = QSortFilterProxyModel()
+        self.proxy.setSourceModel(self.model)
+        self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.proxy.setFilterKeyColumn(-1)
+
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
+        self.table.setSortingEnabled(True)
+        self.table.setEditTriggers(QTableView.NoEditTriggers)
+        # Deliberately no Stretch resize mode on any column here - every
+        # column stays freely user-resizable (the complaint about the other
+        # tables was that they aren't), just sized sensibly to start.
+        self.table.resizeColumnsToContents()
+        layout.addWidget(self.table, 1)
+
+        self._diff_type_col = diff_type_col
+        self._row_count_label = QLabel()
+        self._row_count_label.setStyleSheet("color: #999; font-style: italic;")
+        layout.addWidget(self._row_count_label)
+        self._update_row_count_label()
+
+        btn_row = QHBoxLayout()
+        view_raw_btn = QPushButton("View Raw CSV")
+        view_raw_btn.setToolTip("Open the CSV file itself with your system's default app (e.g. Excel)")
+        view_raw_btn.clicked.connect(self._on_view_raw_csv)
+        btn_row.addWidget(view_raw_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1000, int(screen.width() * 0.9)), min(700, int(screen.height() * 0.85)))
+
+    def _apply_filter(self) -> None:
+        text = self.filter_edit.text()
+        diff_type = self.type_combo.currentText() if self.type_combo else "All"
+
+        if diff_type == "All" or self._diff_type_col is None:
+            self.proxy.setFilterFixedString(text)
+            self.proxy.setFilterKeyColumn(-1)
+        else:
+            pattern = re.escape(diff_type)
+            if text:
+                pattern = f"(?=.*{re.escape(diff_type)})(?=.*{re.escape(text)})"
+            self.proxy.setFilterKeyColumn(-1)
+            self.proxy.setFilterRegExp(pattern)
+        self._update_row_count_label()
+
+    def _update_row_count_label(self) -> None:
+        shown = self.proxy.rowCount()
+        total = self.model.rowCount()
+        self._row_count_label.setText(
+            f"Showing {shown} of {total} row(s)" if shown != total else f"{total} row(s)"
+        )
+
+    def _on_view_raw_csv(self) -> None:
+        if self._parent_window is not None and hasattr(self._parent_window, "_open_with_system_default"):
+            self._parent_window._open_with_system_default(self.csv_path, "This report")
+        else:
+            try:
+                if os.name == "nt":
+                    os.startfile(self.csv_path)
+                else:
+                    subprocess.run(["xdg-open", self.csv_path], check=True)
+            except Exception as e:
+                QMessageBox.warning(self, "View Raw CSV", f"Could not open the file:\n{e}")
 
 
 class LiveLogViewerDialog(QDialog):
@@ -1354,7 +1492,7 @@ class MainWindow(QMainWindow):
         self.open_report_btn.setEnabled(False)
         self.open_report_btn.clicked.connect(self.open_report_folder)
         self.view_csv_btn = QPushButton("View CSV")
-        self.view_csv_btn.setToolTip("Open the report file itself with your system's default CSV viewer (e.g. Excel)")
+        self.view_csv_btn.setToolTip("Open the report in a sortable/filterable table (with a View Raw CSV option inside)")
         self.view_csv_btn.setEnabled(False)
         self.view_csv_btn.clicked.connect(self.view_report_csv)
 
@@ -2143,7 +2281,7 @@ class MainWindow(QMainWindow):
         view_log_btn.clicked.connect(self.on_view_selected_log)
         filter_row.addWidget(view_log_btn)
         view_acl_btn = QPushButton("View ACL Report")
-        view_acl_btn.setToolTip("Open the selected run's chained ACL comparison CSV, if it has one")
+        view_acl_btn.setToolTip("Open the selected run's chained ACL comparison in a sortable/filterable table, if it has one")
         view_acl_btn.clicked.connect(self.on_view_selected_acl_report)
         filter_row.addWidget(view_acl_btn)
         delete_selected_btn = QPushButton("Delete Selected")
@@ -2672,12 +2810,27 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_TITLE, f"Could not open folder:\n{e}")
 
     def view_report_csv(self) -> None:
-        self._open_with_system_default(self.last_output_path, "The report")
+        self._open_csv_table_viewer(self.last_output_path, "ACL Comparison Report", "The report")
+
+    def _open_csv_table_viewer(self, path: Optional[str], title: str, what: str = "The file") -> None:
+        """Opens a CSV report in the interactive CsvTableViewerDialog (sortable,
+        resizable columns, filterable) rather than just handing it to the
+        system's default app. Shared by the Compare tab's View CSV button and
+        the Run History tab's View ACL Report button."""
+        if not path:
+            QMessageBox.information(self, APP_TITLE, f"{what} has no recorded file path.")
+            return
+        abspath = os.path.abspath(path)
+        if not os.path.isfile(abspath):
+            QMessageBox.warning(self, APP_TITLE, f"{what} was not found on disk:\n{abspath}")
+            return
+        dialog = CsvTableViewerDialog(self, title, abspath)
+        dialog.show()
 
     def _open_with_system_default(self, path: Optional[str], what: str = "The file") -> None:
         """Opens a file with the system's default application for its type
-        (e.g. Excel for .csv). Shared by the Compare tab's View CSV button
-        and the Run History tab's View Log / View ACL Report buttons."""
+        (e.g. Excel for .csv). Used for the Run History tab's View Log button,
+        and as the "View Raw CSV" fallback inside CsvTableViewerDialog."""
         if not path:
             QMessageBox.information(self, APP_TITLE, f"{what} has no recorded file path.")
             return
@@ -2720,7 +2873,7 @@ class MainWindow(QMainWindow):
         if not run.get("acl_chained"):
             QMessageBox.information(self, APP_TITLE, "This run didn't have an ACL comparison chained to it.")
             return
-        self._open_with_system_default(run.get("acl_report_path"), "This run's ACL comparison report")
+        self._open_csv_table_viewer(run.get("acl_report_path"), "ACL Comparison Report", "This run's ACL comparison report")
 
     def _selected_history_run_id(self) -> Optional[str]:
         selection_model = self.history_table.selectionModel()
