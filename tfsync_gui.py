@@ -23,7 +23,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QDir, QTime, QDate, QDateTime, QTimer
 from PyQt5.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush, QPalette
@@ -245,6 +245,20 @@ def format_local_datetime(iso_str: Optional[str]) -> str:
         return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         return iso_str
+
+
+def _apply_cell_tooltips(row: List[QStandardItem]) -> None:
+    """
+    Sets each item's tooltip to its own full text. None of these tables
+    support per-column resizing beyond their initial width, so long values
+    (a full UNC path in Source/Destination, a long Description, an ACE
+    detail, etc.) routinely get truncated - hovering is the fallback way
+    to read the full content without needing to resize anything.
+    """
+    for item in row:
+        text = item.text()
+        if text:
+            item.setToolTip(text)
 
 
 class ScanWorker(QThread):
@@ -527,19 +541,27 @@ class JobEditorDialog(QDialog):
 
         self.name_edit = QLineEdit(job["name"] if job else "")
         self.name_edit.setPlaceholderText("e.g. Nightly finance share sync")
+        self.name_edit.setToolTip("A label for this job - shown in the Job Queue table, run history, and scheduled task name.")
         form.addRow("Name:", self.name_edit)
 
         self.source_edit = QLineEdit(job["source"] if job else "")
         self.source_edit.setPlaceholderText(r"\\srcserver\share\path")
+        self.source_edit.setToolTip("The share/folder this job syncs FROM.")
         form.addRow("Source:", self._path_row(self.source_edit))
 
         self.dest_edit = QLineEdit(job["dest"] if job else "")
         self.dest_edit.setPlaceholderText(r"\\dstserver\share\path")
+        self.dest_edit.setToolTip("The share/folder this job syncs TO.")
         form.addRow("Destination:", self._path_row(self.dest_edit))
 
         mode_row = QHBoxLayout()
         self.mode_copy_radio = QRadioButton("Copy-only")
+        self.mode_copy_radio.setToolTip("robocopy /E - copies new/changed files and folders, never deletes anything in the destination.")
         self.mode_mirror_radio = QRadioButton("Mirror")
+        self.mode_mirror_radio.setToolTip(
+            "robocopy /MIR - makes the destination an exact copy of the source, "
+            "DELETING any files/folders in the destination that don't exist in the source."
+        )
         mode_group = QButtonGroup(self)
         mode_group.addButton(self.mode_copy_radio)
         mode_group.addButton(self.mode_mirror_radio)
@@ -557,6 +579,10 @@ class JobEditorDialog(QDialog):
         freq_row = QHBoxLayout()
         freq_row.addWidget(QLabel("Frequency:"))
         self.freq_combo = QComboBox()
+        self.freq_combo.setToolTip(
+            "Registers a real Windows Task Scheduler task under \\TFSync\\ that runs "
+            "this job unattended - see Run As below for which account it runs as."
+        )
         # (label, kind) - kind matches task_scheduler's decompose/build "kind" values,
         # except "none" which just means "no schedule".
         self._freq_kinds = [
@@ -765,18 +791,34 @@ class JobEditorDialog(QDialog):
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 128)
         self.threads_spin.setValue(job["threads"] if job else 16)
+        self.threads_spin.setToolTip(
+            "Robocopy /MT thread count. Higher speeds up large syncs but can overload "
+            "the file server or your connection - 16-32 is usually a good starting point. "
+            "Also counts toward the \u201cCombined robocopy threads\u201d warning on the Job Queue tab."
+        )
         form.addRow("Threads (/MT):", self.threads_spin)
 
         self.retries_spin = QSpinBox()
         self.retries_spin.setRange(0, 100)
         self.retries_spin.setValue(job["retries"] if job else 3)
+        self.retries_spin.setToolTip("Robocopy /R - how many times to retry a file that's locked or briefly inaccessible before giving up on it.")
         form.addRow("Retries:", self.retries_spin)
 
         self.auto_verify_chk = QCheckBox("Automatically run ACL comparison after each successful run")
+        self.auto_verify_chk.setToolTip(
+            "After a successful (non-dry-run, non-cancelled) sync, automatically runs an "
+            "ACL comparison against the same source/dest and attaches the summary to this "
+            "run's history entry - its report is saved under job_reports/."
+        )
         self.auto_verify_chk.setChecked(bool(job["auto_verify_acl"]) if job else False)
         form.addRow("", self.auto_verify_chk)
 
         self.enabled_chk = QCheckBox("Enabled")
+        self.enabled_chk.setToolTip(
+            "Unchecking this disables the job: its scheduled task (if any) is removed, "
+            "though the job definition and its run history are kept. Re-check and save "
+            "to re-register the schedule."
+        )
         self.enabled_chk.setChecked(bool(job["enabled"]) if job else True)
         form.addRow("", self.enabled_chk)
 
@@ -1031,10 +1073,18 @@ class MainWindow(QMainWindow):
 
         self.source_edit = QLineEdit()
         self.source_edit.setPlaceholderText(r"\\srcserver\share\path")
+        self.source_edit.setToolTip(
+            "The share/folder to sync or compare FROM. Used by both the Sync and "
+            "Compare ACLs tabs - shared here so you only enter it once."
+        )
         paths_form.addRow("Source:", self._path_row(self.source_edit))
 
         self.dest_edit = QLineEdit()
         self.dest_edit.setPlaceholderText(r"\\dstserver\share\path")
+        self.dest_edit.setToolTip(
+            "The share/folder to sync or compare TO. Used by both the Sync and "
+            "Compare ACLs tabs - shared here so you only enter it once."
+        )
         paths_form.addRow("Destination:", self._path_row(self.dest_edit))
 
         paths_box.setLayout(paths_form)
@@ -1065,7 +1115,12 @@ class MainWindow(QMainWindow):
 
         mode_row = QHBoxLayout()
         self.mode_copy_radio = QRadioButton("Copy-only (safe - never deletes anything in destination)")
+        self.mode_copy_radio.setToolTip("robocopy /E - copies new/changed files and folders, never deletes anything in the destination.")
         self.mode_mirror_radio = QRadioButton("Mirror (exact sync - DELETES extras in destination)")
+        self.mode_mirror_radio.setToolTip(
+            "robocopy /MIR - makes the destination an exact copy of the source, "
+            "DELETING any files/folders in the destination that don't exist in the source."
+        )
         self.mode_copy_radio.setChecked(True)
         mode_group = QButtonGroup(tab)
         mode_group.addButton(self.mode_copy_radio)
@@ -1078,28 +1133,39 @@ class MainWindow(QMainWindow):
             "I understand Mirror mode will permanently delete files/folders in the "
             "destination that don't exist in the source"
         )
+        self.mirror_confirm_chk.setToolTip("Required before Run Sync is enabled in Mirror mode, as a safety check against accidental data loss.")
         self.mirror_confirm_chk.setEnabled(False)
         form.addRow("", self.mirror_confirm_chk)
         self.mode_mirror_radio.toggled.connect(self._on_sync_mode_changed)
         self.mirror_confirm_chk.toggled.connect(self._update_sync_run_enabled)
 
         self.preserve_perms_chk = QCheckBox("Preserve permissions, owner, and timestamps (robocopy /COPY:DATSO)")
+        self.preserve_perms_chk.setToolTip(
+            "Copies NTFS ACLs, owner, and timestamps along with file data (robocopy "
+            "/COPY:DATSO). Turning this off only copies file data/attributes, not "
+            "permissions - rarely what you want for a migration."
+        )
         self.preserve_perms_chk.setChecked(True)
         form.addRow("", self.preserve_perms_chk)
 
         self.sync_threads_spin = QSpinBox()
         self.sync_threads_spin.setRange(1, 128)
         self.sync_threads_spin.setValue(16)
-        self.sync_threads_spin.setToolTip("Robocopy /MT thread count")
+        self.sync_threads_spin.setToolTip(
+            "Robocopy /MT thread count. Higher speeds up large syncs but can overload "
+            "the file server or your connection - 16-32 is usually a good starting point."
+        )
         form.addRow("Threads:", self.sync_threads_spin)
 
         retry_row = QHBoxLayout()
         self.sync_retries_spin = QSpinBox()
         self.sync_retries_spin.setRange(0, 100)
         self.sync_retries_spin.setValue(3)
+        self.sync_retries_spin.setToolTip("Robocopy /R - how many times to retry a file that's locked or briefly inaccessible before giving up on it.")
         self.sync_wait_spin = QSpinBox()
         self.sync_wait_spin.setRange(0, 3600)
         self.sync_wait_spin.setValue(5)
+        self.sync_wait_spin.setToolTip("Robocopy /W - seconds to wait between retries.")
         retry_row.addWidget(QLabel("Retries:"))
         retry_row.addWidget(self.sync_retries_spin)
         retry_row.addWidget(QLabel("Wait (sec):"))
@@ -1108,6 +1174,11 @@ class MainWindow(QMainWindow):
         form.addRow("On error:", retry_row)
 
         self.sync_log_edit = QLineEdit(os.path.join(os.getcwd(), "robocopy_sync.log"))
+        self.sync_log_edit.setToolTip(
+            "Where robocopy writes its full transcript for this run (auto-filled from "
+            "the source path unless you edit it). Recorded against this run's history "
+            "entry, viewable via View Log in the Run History tab."
+        )
         form.addRow("Log file:", self._path_row(self.sync_log_edit, is_save=True, filter_str="Log files (*.log)"))
 
         options_box.setLayout(form)
@@ -1222,11 +1293,20 @@ class MainWindow(QMainWindow):
         job_row = QHBoxLayout()
         self.compare_job_combo = QComboBox()
         self.compare_job_combo.addItem("\u2014 Select a job from the queue \u2014", None)
+        self.compare_job_combo.setToolTip(
+            "Pick a saved job to load its source/dest/threads into this tab, "
+            "instead of typing them in manually."
+        )
         self.compare_job_combo.currentIndexChanged.connect(self._on_compare_job_combo_changed)
         job_row.addWidget(self.compare_job_combo, 1)
         form.addRow("Load from Job Queue:", job_row)
 
         self.output_edit = QLineEdit(os.path.join(os.getcwd(), "acl_comparison_report.csv"))
+        self.output_edit.setToolTip(
+            "Where the comparison report CSV is written (auto-filled from the source "
+            "path unless you edit it). Use View CSV below to open it once the "
+            "comparison finishes."
+        )
         output_row = self._path_row(self.output_edit, is_save=True, filter_str="CSV files (*.csv)")
         form.addRow("Output CSV:", output_row)
 
@@ -1235,12 +1315,19 @@ class MainWindow(QMainWindow):
             "Optional - e.g. a server name, for SIDs that only resolve on that host "
             "(auto-filled from the source server once you enter a source path)"
         )
+        self.resolve_host_edit.setToolTip(
+            "Some SIDs (e.g. local accounts) only resolve to a readable name on the "
+            "machine that issued them. Set this to that server if owner/group names "
+            "are showing as raw SIDs instead of usernames."
+        )
         form.addRow("Resolve unknown SIDs against:", self.resolve_host_edit)
 
         self.dirs_only_chk = QCheckBox("Folders only (skip individual files, faster)")
+        self.dirs_only_chk.setToolTip("Compares only folder ACLs, skipping every individual file - much faster on large trees, at the cost of not catching file-level permission differences.")
         form.addRow("", self.dirs_only_chk)
 
         self.show_matches_chk = QCheckBox("Include matching items in report (shown as MATCH rows)")
+        self.show_matches_chk.setToolTip("By default only differences are reported. Check this to also include a MATCH row for every item that's identical - useful for a complete audit trail, but makes for a much longer report.")
         form.addRow("", self.show_matches_chk)
 
         self.threads_spin = QSpinBox()
@@ -1363,6 +1450,11 @@ class MainWindow(QMainWindow):
         self.max_concurrent_spin = QSpinBox()
         self.max_concurrent_spin.setRange(1, 20)
         self.max_concurrent_spin.setValue(self.max_concurrent_jobs)
+        self.max_concurrent_spin.setToolTip(
+            "A real cap, not just a warning: \u201cRun Now\u201d is blocked once this many jobs "
+            "are running at once, to avoid an unbounded pile of simultaneous robocopy "
+            "processes. Doesn't limit how many jobs you can define or schedule."
+        )
         self.max_concurrent_spin.valueChanged.connect(self._on_max_concurrent_changed)
         settings_row.addWidget(self.max_concurrent_spin)
         settings_row.addSpacing(20)
@@ -1370,6 +1462,11 @@ class MainWindow(QMainWindow):
         self.thread_warning_spin = QSpinBox()
         self.thread_warning_spin.setRange(1, 1000)
         self.thread_warning_spin.setValue(self.thread_warning_threshold)
+        self.thread_warning_spin.setToolTip(
+            "A soft warning, not a cap: once the combined /MT thread count across all "
+            "currently-running jobs passes this number, the banner below turns orange "
+            "- but nothing is blocked."
+        )
         self.thread_warning_spin.valueChanged.connect(self._on_thread_warning_changed)
         settings_row.addWidget(self.thread_warning_spin)
         settings_row.addStretch()
@@ -1486,6 +1583,7 @@ class MainWindow(QMainWindow):
                 QStandardItem(next_run),
             ]
             row[0].setData(job["job_id"], Qt.UserRole)
+            _apply_cell_tooltips(row)
             if is_running:
                 for item in row:
                     item.setBackground(QBrush(QColor("#c8f7c5")))
@@ -2009,12 +2107,18 @@ class MainWindow(QMainWindow):
         retention_row.addWidget(QLabel("Keep per job (and per manual runs):"))
         self.retention_combo = QComboBox()
         self.retention_combo.addItems(["Keep all runs", "Keep last run only", "Keep last N runs"])
+        self.retention_combo.setToolTip(
+            "Applied automatically after every new run is recorded, per job (and "
+            "separately for manual/ad-hoc runs). Never touches lifetime usage totals "
+            "used for the licensing quota, regardless of how much history is kept."
+        )
         self.retention_combo.currentIndexChanged.connect(self._on_retention_combo_changed)
         retention_row.addWidget(self.retention_combo)
 
         self.retention_count_spin = QSpinBox()
         self.retention_count_spin.setRange(2, 100000)
         self.retention_count_spin.setValue(store.DEFAULT_RETENTION_COUNT)
+        self.retention_count_spin.setToolTip("How many runs to keep per job (and separately for manual runs), when \u201cKeep last N runs\u201d is selected.")
         self.retention_count_spin.valueChanged.connect(self._on_retention_count_changed)
         retention_row.addWidget(self.retention_count_spin)
 
@@ -2165,6 +2269,7 @@ class MainWindow(QMainWindow):
                 QStandardItem(acl_col),
             ]
             row[0].setData(run["run_id"], Qt.UserRole)
+            _apply_cell_tooltips(row)
             if run["is_failure"]:
                 for item in row:
                     item.setBackground(QBrush(QColor("#f8d7da")))
@@ -2469,6 +2574,7 @@ class MainWindow(QMainWindow):
         self._csv_writer.writerow([row[field] for field in core.ROW_FIELDS])
 
         items = [QStandardItem(str(row[field])) for field in core.ROW_FIELDS]
+        _apply_cell_tooltips(items)
         color = ROW_COLORS.get(row["DifferenceType"])
         if color:
             for item in items:

@@ -294,6 +294,11 @@ only ever print "this must run on Windows."
   type, dark mode by default (with a light/dark toggle), CSV export as
   results stream in, and auto-fill of the SID-resolution host and report
   filename from the source path
+- Every table cell (Job Queue, Run History, the Compare ACLs results
+  table) carries its full text as a tooltip, since none of these tables
+  support per-column resizing - hover a truncated Source/Destination path,
+  Description, or ACE detail to read it in full. Every input field across
+  the app (Sync, Compare, and the Job Editor) has an explanatory tooltip too.
 
 ## Requirements
 
