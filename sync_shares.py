@@ -47,6 +47,8 @@ def main() -> None:
     parser.add_argument("--wait", type=int, default=5, help="Robocopy /W retry wait in seconds (default 5)")
     parser.add_argument("--no-preserve-permissions", action="store_true",
                          help="Skip copying security/ownership info (uses /COPY:DAT instead of /COPY:DATSO)")
+    parser.add_argument("--long-paths", action="store_true",
+                         help="Pass source/dest to robocopy in \\\\?\\UNC\\... extended-length syntax (paths over 260 chars)")
     parser.add_argument("--log", default="robocopy_sync.log", help="Robocopy log file path")
     parser.add_argument("--yes", action="store_true",
                          help="Skip the confirmation prompt for --mirror (e.g. for unattended/scripted runs)")
@@ -82,6 +84,7 @@ def main() -> None:
         threads=args.threads, retries=args.retries, wait_seconds=args.wait,
         preserve_permissions=not args.no_preserve_permissions,
         log_path=args.log,
+        long_paths=args.long_paths,
         line_cb=print,
     )
 

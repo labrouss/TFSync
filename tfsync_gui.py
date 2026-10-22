@@ -38,6 +38,7 @@ from PyQt5.QtWidgets import (
 )
 
 import acl_compare_core as core
+import long_path_scan
 import robocopy_sync
 import tfsync_store as store
 import task_scheduler
@@ -208,7 +209,7 @@ JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
 
 JOB_EXPORT_FIELDS = ["name", "source", "dest", "mode", "schedule_expr",
                       "threads", "retries", "auto_verify_acl", "enabled", "run_as_user",
-                      "source_username", "dest_username"]
+                      "source_username", "dest_username", "long_paths"]
 
 HISTORY_COLUMNS = ["Start Time (local)", "Job", "Source", "Destination", "Mode", "Dry Run",
                     "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
@@ -301,6 +302,318 @@ class ScanWorker(QThread):
             self.failed.emit(str(e))
 
 
+class LongPathScanWorker(QThread):
+    progress = pyqtSignal(int, int, int)
+    finished_ok = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, source: str, dest: Optional[str], threshold: int, include_dirs: bool):
+        super().__init__()
+        self.source = source
+        self.dest = dest
+        self.threshold = threshold
+        self.include_dirs = include_dirs
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            result = long_path_scan.scan_long_paths(
+                self.source, self.dest, threshold=self.threshold,
+                include_dirs=self.include_dirs,
+                progress_cb=self.progress.emit,
+                should_cancel=lambda: self._cancel,
+            )
+            self.finished_ok.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class LongPathScanDialog(QDialog):
+    """
+    Pre-sync scan of the source for paths of 260+ characters (Win32 MAX_PATH),
+    including the projected length under the destination root, plus the
+    migration-host LongPathsEnabled registry check and the customer-facing
+    scope-alignment statement. Used to decide - before the initial full
+    sync - whether the folder structure needs flattening for end-user
+    compatibility.
+    """
+
+    COLUMNS = ["Relative Path", "Type", "Source Length", "Dest Length", "Exceeds"]
+
+    def __init__(self, parent, source: str, dest: str, job_name: str = ""):
+        super().__init__(parent)
+        self.source = source
+        self.dest = dest
+        self.result: Optional[dict] = None
+        self.worker: Optional[LongPathScanWorker] = None
+        self.setWindowTitle("Long Path Scan" + (f" - {job_name}" if job_name else ""))
+        self.setWindowModality(Qt.NonModal)
+        self.resize(980, 700)
+
+        root = QVBoxLayout(self)
+
+        # --- migration host check -------------------------------------
+        self.host_label = QLabel()
+        self.host_label.setWordWrap(True)
+        self.host_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(self.host_label)
+        host_row = QHBoxLayout()
+        recheck_btn = QPushButton("Re-check Host")
+        recheck_btn.setToolTip("Read HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\\LongPathsEnabled again")
+        recheck_btn.clicked.connect(self._refresh_host_status)
+        copy_fix_btn = QPushButton("Copy Fix Instructions")
+        copy_fix_btn.setToolTip("Copy the registry fix (reg add / PowerShell) to the clipboard to run from an elevated prompt")
+        copy_fix_btn.clicked.connect(self._copy_fix)
+        host_row.addWidget(recheck_btn)
+        host_row.addWidget(copy_fix_btn)
+        host_row.addStretch()
+        root.addLayout(host_row)
+
+        # --- scan options ---------------------------------------------
+        opts = QGroupBox("Scan")
+        form = QFormLayout(opts)
+        src_lbl = QLabel(source)
+        src_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("Source:", src_lbl)
+        dst_lbl = QLabel(dest or "(not set - source lengths only)")
+        dst_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("Destination:", dst_lbl)
+        ext = QLabel(long_path_scan.to_extended_path(source) if long_path_scan.is_unc_or_drive_path(source) else "n/a")
+        ext.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        ext.setToolTip("Extended-length form TFSync uses when \u201cUse long-path syntax\u201d is enabled.")
+        form.addRow("Long-path syntax:", ext)
+
+        opt_row = QHBoxLayout()
+        self.threshold_spin = QSpinBox()
+        self.threshold_spin.setRange(50, 32000)
+        self.threshold_spin.setValue(long_path_scan.MAX_PATH)
+        self.threshold_spin.setToolTip(
+            "Flag paths whose length is at least this many characters. 260 is the Win32 "
+            "MAX_PATH (which includes the terminating NUL, so a 260-character path already fails "
+            "in non-long-path-aware software)."
+        )
+        self.include_dirs_chk = QCheckBox("Include folders")
+        self.include_dirs_chk.setChecked(True)
+        self.include_dirs_chk.setToolTip("Also flag folders (not just files) whose own path reaches the threshold.")
+        self.start_btn = QPushButton("Start Scan")
+        self.start_btn.clicked.connect(self.start_scan)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_scan)
+        opt_row.addWidget(QLabel("Threshold (chars):"))
+        opt_row.addWidget(self.threshold_spin)
+        opt_row.addWidget(self.include_dirs_chk)
+        opt_row.addStretch()
+        opt_row.addWidget(self.start_btn)
+        opt_row.addWidget(self.cancel_btn)
+        form.addRow(opt_row)
+        root.addWidget(opts)
+
+        self.progress_label = QLabel("Idle")
+        root.addWidget(self.progress_label)
+        self.summary_label = QLabel("")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet("font-weight: 600;")
+        root.addWidget(self.summary_label)
+
+        # --- results ----------------------------------------------------
+        filter_row = QHBoxLayout()
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter results...")
+        self.filter_edit.setClearButtonEnabled(True)
+        filter_row.addWidget(QLabel("Filter:"))
+        filter_row.addWidget(self.filter_edit, 1)
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["All", "File", "Directory"])
+        filter_row.addWidget(self.type_combo)
+        root.addLayout(filter_row)
+
+        self.model = QStandardItemModel(0, len(self.COLUMNS))
+        self.model.setHorizontalHeaderLabels(self.COLUMNS)
+        self.proxy = QSortFilterProxyModel(self)
+        self.proxy.setSourceModel(self.model)
+        self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.proxy.setFilterKeyColumn(-1)
+        self.filter_edit.textChanged.connect(self.proxy.setFilterFixedString)
+        self.type_combo.currentTextChanged.connect(self._on_type_filter)
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.Interactive)
+        hdr.setStretchLastSection(True)
+        self.table.setColumnWidth(0, 560)
+        root.addWidget(self.table, 1)
+
+        self.top_label = QLabel("")
+        self.top_label.setWordWrap(True)
+        self.top_label.setToolTip("Top-level folders containing the most over-limit paths - the usual candidates for flattening.")
+        root.addWidget(self.top_label)
+
+        # --- scope statement -------------------------------------------
+        root.addWidget(QLabel("Scope Alignment statement (for the customer):"))
+        self.scope_view = QPlainTextEdit(long_path_scan.SCOPE_ALIGNMENT_STATEMENT)
+        self.scope_view.setReadOnly(True)
+        self.scope_view.setMaximumHeight(150)
+        root.addWidget(self.scope_view)
+
+        btns = QHBoxLayout()
+        self.export_btn = QPushButton("Export CSV...")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_csv)
+        copy_scope_btn = QPushButton("Copy Scope Statement")
+        copy_scope_btn.clicked.connect(self._copy_scope)
+        copy_report_btn = QPushButton("Copy Summary + Statement")
+        copy_report_btn.setToolTip("Copy the scan summary followed by the scope-alignment statement, ready to paste into a customer email.")
+        copy_report_btn.clicked.connect(self._copy_report)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btns.addWidget(self.export_btn)
+        btns.addWidget(copy_scope_btn)
+        btns.addWidget(copy_report_btn)
+        btns.addStretch()
+        btns.addWidget(close_btn)
+        root.addLayout(btns)
+
+        self._refresh_host_status()
+        self.start_scan()
+
+    # -- host check -----------------------------------------------------
+    def _refresh_host_status(self) -> None:
+        info = long_path_scan.check_long_paths_enabled()
+        if not info["applicable"]:
+            text, color = f"Migration host: {info['message']}", "#999"
+        elif info["enabled"]:
+            text, color = f"Migration host: {info['message']}", "#2e7d32"
+        elif info["enabled"] is None:
+            text, color = f"Migration host: {info['message']}", "#b26a00"
+        else:
+            text = (f"Migration host: {info['message']} Set {long_path_scan.REGISTRY_DISPLAY}"
+                    f"\\{long_path_scan.REGISTRY_VALUE} = 1 (DWORD) before the initial full sync.")
+            color = "#c62828"
+        self.host_label.setText(text)
+        self.host_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+
+    def _copy_fix(self) -> None:
+        QApplication.clipboard().setText(long_path_scan.HOST_GUIDANCE)
+        QMessageBox.information(self, APP_TITLE, "Fix instructions copied to the clipboard.\n\n" + long_path_scan.HOST_GUIDANCE)
+
+    # -- scan -----------------------------------------------------------
+    def start_scan(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        self.model.removeRows(0, self.model.rowCount())
+        self.result = None
+        self.export_btn.setEnabled(False)
+        self.summary_label.setText("")
+        self.top_label.setText("")
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.progress_label.setText("Scanning...")
+        self.worker = LongPathScanWorker(
+            self.source, self.dest or None, self.threshold_spin.value(), self.include_dirs_chk.isChecked()
+        )
+        self.worker.progress.connect(
+            lambda f, d, n: self.progress_label.setText(f"Scanning... {f:,} files, {d:,} folders, {n:,} over the limit")
+        )
+        self.worker.finished_ok.connect(self._scan_done)
+        self.worker.failed.connect(self._scan_failed)
+        self.worker.start()
+
+    def cancel_scan(self) -> None:
+        if self.worker:
+            self.worker.cancel()
+            self.progress_label.setText("Cancelling...")
+
+    def _scan_failed(self, message: str) -> None:
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.progress_label.setText("Scan failed")
+        QMessageBox.critical(self, APP_TITLE, f"Long path scan failed:\n{message}")
+
+    def _scan_done(self, result: dict) -> None:
+        self.result = result
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.export_btn.setEnabled(True)
+        self.progress_label.setText("Cancelled (partial results)" if result["cancelled"] else "Scan complete")
+        self.summary_label.setText(long_path_scan.summarize(result))
+        self.summary_label.setStyleSheet(
+            "font-weight: 600; color: %s;" % ("#c62828" if result["flagged"] else "#2e7d32")
+        )
+
+        self.table.setSortingEnabled(False)
+        for row in result["rows"]:
+            items = []
+            for key in ("RelativePath", "ItemType", "SourceLength", "DestLength", "Exceeds"):
+                item = QStandardItem()
+                value = row[key]
+                if key in ("SourceLength", "DestLength") and value != "":
+                    item.setData(int(value), Qt.DisplayRole)   # numeric -> sorts numerically
+                else:
+                    item.setText(str(value))
+                item.setToolTip(row["FullSourcePath"])
+                items.append(item)
+            self.model.appendRow(items)
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(2, Qt.DescendingOrder)
+
+        if result["by_top_folder"]:
+            top = ", ".join(f"{name} ({count:,})" for name, count in result["by_top_folder"][:8])
+            self.top_label.setText("Top-level folders with the most over-limit paths: " + top)
+        if result["errors"]:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                f"{len(result['errors'])} folder(s) could not be read (permissions or network errors), "
+                f"so paths below them were not checked. First error:\n{result['errors'][0][0]}\n{result['errors'][0][1]}",
+            )
+
+    def _on_type_filter(self, text: str) -> None:
+        # Column 1 holds the item type; combine with the free-text filter by
+        # filtering this column through a dedicated regex on the proxy.
+        self.proxy.setFilterKeyColumn(-1)
+        if text == "All":
+            self.proxy.setFilterFixedString(self.filter_edit.text())
+        else:
+            self.filter_edit.clear()
+            self.proxy.setFilterKeyColumn(1)
+            self.proxy.setFilterFixedString(text)
+
+    # -- exports --------------------------------------------------------
+    def export_csv(self) -> None:
+        if not self.result:
+            return
+        default = os.path.join(os.getcwd(), "long_path_scan.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Long Path Scan", default, "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            long_path_scan.write_csv(self.result, path)
+        except OSError as e:
+            QMessageBox.critical(self, APP_TITLE, f"Could not write {path}:\n{e}")
+            return
+        QMessageBox.information(self, APP_TITLE, f"Exported {self.result['flagged']:,} rows to\n{path}")
+
+    def _copy_scope(self) -> None:
+        QApplication.clipboard().setText(long_path_scan.SCOPE_ALIGNMENT_STATEMENT)
+
+    def _copy_report(self) -> None:
+        summary = long_path_scan.summarize(self.result) if self.result else "(scan not completed)"
+        QApplication.clipboard().setText(summary + "\n\n" + long_path_scan.SCOPE_ALIGNMENT_STATEMENT)
+
+    def closeEvent(self, event) -> None:
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.worker.wait(5000)
+        super().closeEvent(event)
+
+
 class SyncWorker(QThread):
     log = pyqtSignal(str)
     finished_ok = pyqtSignal(dict)
@@ -308,8 +621,9 @@ class SyncWorker(QThread):
 
     def __init__(self, source: str, dest: str, mirror: bool, dry_run: bool,
                  threads: int, retries: int, wait_seconds: int,
-                 preserve_permissions: bool, log_path: str):
+                 preserve_permissions: bool, log_path: str, long_paths: bool = False):
         super().__init__()
+        self.long_paths = long_paths
         self.source = source
         self.dest = dest
         self.mirror = mirror
@@ -332,6 +646,7 @@ class SyncWorker(QThread):
                 threads=self.threads, retries=self.retries, wait_seconds=self.wait_seconds,
                 preserve_permissions=self.preserve_permissions,
                 log_path=self.log_path,
+                long_paths=self.long_paths,
                 line_cb=self.log.emit,
                 should_cancel=lambda: self._cancel,
             )
@@ -942,6 +1257,15 @@ class JobEditorDialog(QDialog):
         self.retries_spin.setToolTip("Robocopy /R - how many times to retry a file that's locked or briefly inaccessible before giving up on it.")
         form.addRow("Retries:", self.retries_spin)
 
+        self.long_paths_chk = QCheckBox("Use long-path syntax (\\\\?\\UNC\\...) for source and destination")
+        self.long_paths_chk.setToolTip(
+            "Passes the source and destination to robocopy in extended-length form, e.g. "
+            "\\\\?\\UNC\\server\\share\\folder, so paths over 260 characters work. "
+            "Requires UNC (\\\\server\\share) or drive-letter paths."
+        )
+        self.long_paths_chk.setChecked(bool(job["long_paths"]) if job and "long_paths" in job.keys() else False)
+        form.addRow("", self.long_paths_chk)
+
         self.auto_verify_chk = QCheckBox("Automatically run ACL comparison after each successful run")
         self.auto_verify_chk.setToolTip(
             "After a successful (non-dry-run, non-cancelled) sync, automatically runs an "
@@ -1148,6 +1472,7 @@ class JobEditorDialog(QDialog):
             "threads": self.threads_spin.value(),
             "retries": self.retries_spin.value(),
             "auto_verify_acl": self.auto_verify_chk.isChecked(),
+            "long_paths": self.long_paths_chk.isChecked(),
             "enabled": self.enabled_chk.isChecked(),
             "run_as_user": self.runas_user_edit.text().strip() if self.runas_stored_radio.isChecked() else None,
             "source_username": self.source_cred_user_edit.text().strip() if self.source_creds_chk.isChecked() else None,
@@ -1286,6 +1611,15 @@ class MainWindow(QMainWindow):
         self.preserve_perms_chk.setChecked(True)
         form.addRow("", self.preserve_perms_chk)
 
+        self.sync_long_paths_chk = QCheckBox("Use long-path syntax (\\\\?\\UNC\\...) for source and destination")
+        self.sync_long_paths_chk.setToolTip(
+            "Passes source and destination to robocopy in extended-length form, e.g. "
+            "\\\\?\\UNC\\server\\share\\folder, so paths over 260 characters work. "
+            "Requires UNC (\\\\server\\share) or drive-letter paths. Run \u201cScan Long Paths\u201d first "
+            "to see whether you need it."
+        )
+        form.addRow("", self.sync_long_paths_chk)
+
         self.sync_threads_spin = QSpinBox()
         self.sync_threads_spin.setRange(1, 128)
         self.sync_threads_spin.setValue(16)
@@ -1347,6 +1681,14 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.cancel_sync_btn)
         controls.addWidget(self.schedule_resync_btn)
         controls.addWidget(self.configure_creds_btn)
+        self.scan_long_paths_btn = QPushButton("Scan Long Paths...")
+        self.scan_long_paths_btn.setToolTip(
+            "Scan the source for paths of 260+ characters (also checking the projected length "
+            "under the destination) and verify the migration host's LongPathsEnabled setting. "
+            "Run this before the initial full sync."
+        )
+        self.scan_long_paths_btn.clicked.connect(self.on_scan_long_paths)
+        controls.addWidget(self.scan_long_paths_btn)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -1393,6 +1735,7 @@ class MainWindow(QMainWindow):
             "mode": "mirror" if self.mode_mirror_radio.isChecked() else "copy",
             "threads": self.sync_threads_spin.value(),
             "retries": self.sync_retries_spin.value(),
+            "long_paths": self.sync_long_paths_chk.isChecked(),
             "auto_verify_acl": False,
             "enabled": True,
             "schedule_expr": "daily@02:00",  # sensible starting point - the whole point of this button is to add one
@@ -1406,6 +1749,47 @@ class MainWindow(QMainWindow):
             self.refresh_jobs_table()
             self._sync_job_schedule(job_id, password=password)
             self.tabs.setCurrentIndex(2)  # Job Queue tab
+
+    def on_scan_long_paths(self) -> None:
+        source = self.source_edit.text().strip()
+        dest = self.dest_edit.text().strip()
+        if not source:
+            QMessageBox.information(self, APP_TITLE, "Enter a source first.")
+            return
+        self._open_long_path_scan(source, dest)
+
+    def _open_long_path_scan(self, source: str, dest: str, job_name: str = "") -> None:
+        dialog = LongPathScanDialog(self, source, dest, job_name=job_name)
+        if not hasattr(self, "_long_path_dialogs"):
+            self._long_path_dialogs = []
+        self._long_path_dialogs.append(dialog)   # keep a reference; dialog is non-modal
+        dialog.show()
+
+    def on_scan_job_long_paths(self) -> None:
+        job_id = self._selected_job_id()
+        if not job_id:
+            QMessageBox.information(self, APP_TITLE, "Select a job to scan first.")
+            return
+        job = store.get_job(job_id)
+        if job:
+            self._open_long_path_scan(job["source"], job["dest"], job_name=job["name"])
+
+    def _confirm_long_path_host(self, long_paths_enabled_for_run: bool) -> bool:
+        """Before a real run: warn if this host has LongPathsEnabled off.
+        Returns False if the user chose to cancel."""
+        info = long_path_scan.check_long_paths_enabled()
+        if not info["applicable"] or info["enabled"] is not False:
+            return True
+        reply = QMessageBox.warning(
+            self, APP_TITLE,
+            info["message"] + "\n\n" + long_path_scan.HOST_GUIDANCE +
+            ("\n\nThis run uses long-path syntax, so robocopy can still copy long paths, but other "
+             "tools on this host (Explorer, ACL reads, antivirus, backup agents) may fail on them."
+             if long_paths_enabled_for_run else
+             "\n\nPaths over 260 characters may fail to copy on this host."),
+            QMessageBox.Ignore | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        return reply == QMessageBox.Ignore
 
     def on_configure_share_credentials(self) -> None:
         if os.name != "nt":
@@ -1648,6 +2032,9 @@ class MainWindow(QMainWindow):
         compare_btn = QPushButton("Compare...")
         compare_btn.setToolTip("Open the Compare ACLs tab with this job's source/dest/threads filled in")
         compare_btn.clicked.connect(self.on_compare_job)
+        scan_lp_btn = QPushButton("Scan Long Paths...")
+        scan_lp_btn.setToolTip("Scan the selected job's source for paths of 260+ characters and check the host's LongPathsEnabled setting")
+        scan_lp_btn.clicked.connect(self.on_scan_job_long_paths)
         sync_schedules_btn = QPushButton("Sync Schedules Now")
         sync_schedules_btn.setToolTip(
             "Reconciles Task Scheduler with the jobs database: registers/updates enabled "
@@ -1669,6 +2056,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(run_btn)
         controls.addWidget(live_log_btn)
         controls.addWidget(compare_btn)
+        controls.addWidget(scan_lp_btn)
         controls.addWidget(sync_schedules_btn)
         controls.addWidget(export_jobs_btn)
         controls.addWidget(import_jobs_btn)
@@ -2024,6 +2412,7 @@ class MainWindow(QMainWindow):
             "run_as_user": run_as_user,
             "source_username": source_username,
             "dest_username": dest_username,
+            "long_paths": bool(entry.get("long_paths", False)),
         }
 
     def on_import_jobs(self) -> None:
@@ -2154,6 +2543,9 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 return
 
+        if not self._confirm_long_path_host(bool(job["long_paths"])):
+            return
+
         log_dir = os.path.join(os.getcwd(), "job_logs")
         os.makedirs(log_dir, exist_ok=True)
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
@@ -2163,6 +2555,7 @@ class MainWindow(QMainWindow):
         worker = SyncWorker(
             job["source"], job["dest"], mirror, False,
             job["threads"], job["retries"], 5, True, log_path,
+            long_paths=bool(job["long_paths"]),
         )
         worker.finished_ok.connect(lambda result, jid=job_id: self._job_finished(jid, result))
         worker.failed.connect(lambda message, jid=job_id: self._job_failed(jid, message))
@@ -2521,6 +2914,17 @@ class MainWindow(QMainWindow):
 
         mirror = self.mode_mirror_radio.isChecked()
 
+        use_long = self.sync_long_paths_chk.isChecked()
+        if use_long and not (long_path_scan.is_unc_or_drive_path(source) and long_path_scan.is_unc_or_drive_path(dest)):
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "Long-path syntax needs UNC (\\\\server\\share) or drive-letter (C:\\) paths for both "
+                "source and destination. Fix the paths or turn the option off.",
+            )
+            return
+        if not dry_run and not self._confirm_long_path_host(use_long):
+            return
+
         if mirror and not dry_run:
             reply = QMessageBox.warning(
                 self, APP_TITLE,
@@ -2552,6 +2956,7 @@ class MainWindow(QMainWindow):
             source, dest, mirror, dry_run,
             self.sync_threads_spin.value(), self.sync_retries_spin.value(), self.sync_wait_spin.value(),
             self.preserve_perms_chk.isChecked(), log_path,
+            long_paths=self.sync_long_paths_chk.isChecked(),
         )
         self.sync_worker.log.connect(self.append_sync_log)
         self.sync_worker.finished_ok.connect(lambda result: self.sync_finished(result, dry_run))

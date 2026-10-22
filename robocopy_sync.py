@@ -21,6 +21,8 @@ import subprocess
 import sys
 from typing import Callable, Dict, List, Optional
 
+import long_path_scan
+
 # Robocopy exit codes are a bitmask; each bit means something different and
 # they combine (e.g. 3 = 1 + 2). 16 is a fatal error and overrides everything.
 ROBOCOPY_EXIT_MEANINGS = {
@@ -60,7 +62,13 @@ def build_command(
     preserve_permissions: bool = True,
     log_path: Optional[str] = None,
     excludes: Optional[List[str]] = None,
+    long_paths: bool = False,
 ) -> List[str]:
+    if long_paths:
+        # Explicit extended-length syntax (\\?\UNC\server\share\...) so paths
+        # over 260 characters work regardless of per-process long-path opt-in.
+        source = long_path_scan.to_extended_path(source)
+        dest = long_path_scan.to_extended_path(dest)
     cmd = ["robocopy", source, dest]
     cmd.append("/MIR" if mirror else "/E")
 
@@ -150,6 +158,7 @@ def run_robocopy(
     excludes: Optional[List[str]] = None,
     line_cb: Optional[Callable[[str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    long_paths: bool = False,
 ) -> Dict[str, object]:
     """
     Runs robocopy, streaming each output line to line_cb as it happens.
@@ -163,6 +172,7 @@ def run_robocopy(
         source, dest, mirror=mirror, dry_run=dry_run, threads=threads,
         retries=retries, wait_seconds=wait_seconds,
         preserve_permissions=preserve_permissions, log_path=log_path, excludes=excludes,
+        long_paths=long_paths,
     )
     log(f"$ {' '.join(cmd)}")
 

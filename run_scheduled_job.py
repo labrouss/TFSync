@@ -73,6 +73,7 @@ def main() -> int:
         mirror=(job["mode"] == "mirror"), dry_run=False,
         threads=job["threads"], retries=job["retries"], wait_seconds=5,
         preserve_permissions=True, log_path=log_path,
+        long_paths=bool(job["long_paths"]),
         line_cb=lambda line: print(line, flush=True),
         should_cancel=lambda: False,
     )

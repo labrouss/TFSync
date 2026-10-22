@@ -175,6 +175,8 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN source_username TEXT")
     if "dest_username" not in jobs_cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN dest_username TEXT")
+    if "long_paths" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN long_paths INTEGER NOT NULL DEFAULT 0")
     if "last_run_at" not in jobs_cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN last_run_at TEXT")
 
@@ -196,6 +198,7 @@ def create_job(
     run_as_user: Optional[str] = None,
     source_username: Optional[str] = None,
     dest_username: Optional[str] = None,
+    long_paths: bool = False,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> str:
     """Creates a job definition and returns its job_id."""
@@ -206,11 +209,11 @@ def create_job(
             """INSERT INTO jobs
                (job_id, name, source, dest, mode, schedule_expr, threads,
                 retries, auto_verify_acl, enabled, run_as_user, source_username,
-                dest_username, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                dest_username, long_paths, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, name, source, dest, mode, schedule_expr, threads,
              retries, int(auto_verify_acl), int(enabled), run_as_user or None,
-             source_username or None, dest_username or None, now, now),
+             source_username or None, dest_username or None, int(long_paths), now, now),
         )
     return job_id
 

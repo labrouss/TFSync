@@ -301,6 +301,46 @@ only ever print "this must run on Windows."
   Description, or ACE detail to read it in full. Every input field across
   the app (Sync, Compare, and the Job Editor) has an explanatory tooltip too.
 
+## Long paths (260+ characters)
+
+Windows' classic `MAX_PATH` is 260 characters (including the terminating
+NUL, so a 260-character path already fails in software that isn't
+long-path aware). Qumulo happily stores longer paths, but end-user
+clients (Explorer, older apps) may not be able to open them. TFSync has
+three pieces to deal with this before the initial full sync:
+
+1. **Enable long paths on the migration host.** The scan dialog (and every
+   real run) checks
+   `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled`
+   (DWORD) on the machine running the jobs. If it isn't `1` you get a red
+   banner / a confirmation prompt, and **Copy Fix Instructions** gives the
+   elevated `reg add` / PowerShell command. A reboot (or at least a restart
+   of the migration application) is recommended afterwards.
+2. **Scan the source.** *Scan Long Paths...* (Sync tab, and per selected
+   job on the Job Queue tab) walks the source and lists every file/folder
+   whose path is >= 260 characters (threshold adjustable). When a
+   destination is set it also checks the **projected destination path**
+   (destination root + relative path), because a long destination prefix
+   can push an otherwise fine path over the limit. Results are sortable and
+   filterable, show the top-level folders with the most offenders (the
+   usual candidates for flattening), and export to CSV. Unreadable folders
+   are reported, not silently skipped. Use the results to decide whether the
+   folder structure must be flattened for end-user compatibility.
+3. **Notify the customer.** The dialog carries the *Scope Alignment*
+   statement - Qumulo supports storing paths > 260 characters, but
+   end-user client access issues remain the responsibility of the
+   customer's IT desktop management team - with **Copy Scope Statement**
+   and **Copy Summary + Statement** buttons for pasting into the scope
+   document or an email.
+
+**Long-path syntax.** The *Use long-path syntax* option (Sync tab, per
+job in the job editor, `--long-paths` on `sync_shares.py`) passes source
+and destination to robocopy as `\\?\UNC\server\share\...` (or
+`\\?\C:\...`), so paths over 260 characters work irrespective of
+per-process long-path opt-in. It requires UNC or drive-letter paths and is
+saved with the job (and in Export/Import Jobs). Note the `\\?\` form
+disables Windows' path normalisation, so use backslashes and full paths.
+
 ## Requirements
 
 - Windows, for the CLI/GUI (see platform table above)
@@ -325,6 +365,7 @@ decode_mask.py                         Standalone access-mask decoder (cross-pla
 tfsync_store.py                        SQLite job/run-history store + LicenseManager/UsageTracker stubs (cross-platform, no Windows deps)
 task_scheduler.py                      Schedule expression parsing (cross-platform) + schtasks.exe wrapper (Windows only)
 run_scheduled_job.py                   Headless entry point Task Scheduler invokes to actually run one job
+long_path_scan.py                      Long-path (>=260 char) scan, \\?\UNC\ syntax helpers, LongPathsEnabled registry check, scope statement (cross-platform)
 credential_manager.py                  Source/dest share credentials via Windows Credential Manager (cmdkey.exe wrapper, Windows only)
 requirements.txt                       Python dependencies
 build.bat                              Local Windows build script (PyInstaller + installer)
