@@ -325,6 +325,10 @@ Ways to run it:
   (filter by difference type) and CSV export. The **Verify Checksums...**
   buttons on the Sync tab and the Job Queue tab (for the selected job) jump
   straight to it.
+  Every comparison started from this tab is also recorded in **Run History**
+  as a `verify` run (copy columns left empty; red if anything differed), with
+  its summary in the Checksum Verify column and the report available via
+  **View Checksum Report**.
 * **Verify file checksums after a successful sync** (Sync tab checkbox) -
   switches to the Compare Checksums tab and starts automatically after a live manual sync; the
   summary and CSV report are attached to that run in Run History.
@@ -343,8 +347,10 @@ For large datasets use a **sample** (deterministic - the same files every
 time) for routine runs and a full pass once, after cutover, ideally from a
 host close to the storage with a higher thread count. Reports use the same
 columns as the ACL report (`RelativePath, ItemType, DifferenceType, Detail,
-SourceValue, DestValue`), with the digests in `SourceValue`/`DestValue` for
-mismatches.
+SourceValue, DestValue`), with the digests in `SourceValue`/`DestValue`. On the Compare Checksums
+tab identical files are listed too (as `MATCH` rows, a full record of what was
+checked) unless you tick **Exclude identical files from report**; automatic
+verification after job runs lists problems only.
 
 ## Long paths (260+ characters)
 

@@ -463,6 +463,41 @@ def update_run_acl_summary(
         )
 
 
+def record_verification_run(
+    source: str,
+    dest: str,
+    start_time: datetime,
+    end_time: datetime,
+    description: str,
+    is_failure: bool,
+    job_id: Optional[str] = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> str:
+    """
+    Records a standalone verification (e.g. a checksum comparison started from
+    the Compare Checksums tab, not chained to a sync) as its own run_history
+    row with mode 'verify', so it shows in Run History and can carry a
+    checksum summary/report like any other run. Copy statistics are left
+    empty and nothing is added to usage_ledger. Does not touch the job's
+    last-run status (it isn't a sync run). Returns the new run_id.
+    """
+    run_id = _new_id()
+    duration = max((end_time - start_time).total_seconds(), 0.0)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO run_history
+               (run_id, job_id, source, dest, mode, dry_run, start_time, end_time,
+                duration_seconds, exit_code, description, is_failure, acl_chained, raw_summary_json)
+               VALUES (?, ?, ?, ?, 'verify', 0, ?, ?, ?, ?, ?, ?, 0, '{}')""",
+            (run_id, job_id, source, dest,
+             start_time.astimezone(timezone.utc).isoformat(timespec="seconds"),
+             end_time.astimezone(timezone.utc).isoformat(timespec="seconds"),
+             duration, 1 if is_failure else 0, description, int(is_failure)),
+        )
+    apply_retention_policy(db_path=db_path)
+    return run_id
+
+
 def update_run_checksum_summary(
     run_id: str,
     checksum_summary: Dict[str, Any],

@@ -351,6 +351,8 @@ class ChecksumVerifyPanel(QWidget):
         self.source = self.dest = ""
         self.run_id: Optional[str] = None
         self.job_name = ""
+        self.job_id: Optional[str] = None
+        self._started_at = datetime.now(timezone.utc)
         self.rows: List[dict] = []
         self.counts: Optional[dict] = None
         self.worker: Optional[ChecksumWorker] = None
@@ -389,8 +391,13 @@ class ChecksumVerifyPanel(QWidget):
             "Percentage of files to verify. The sample is deterministic (the same files are chosen "
             "every time). Below 100% extra files in the destination are not reported."
         )
-        self.matches_chk = QCheckBox("Include identical files in report")
-        self.matches_chk.setToolTip("Adds a MATCH row with the digest for every verified file. Makes the report large.")
+        self.matches_chk = QCheckBox("Exclude identical files from report")
+        self.matches_chk.setToolTip(
+            "By default every verified file is listed, including identical ones (a MATCH row with its "
+            "digest) - a complete record of what was checked. Tick this to list only problems; on "
+            "very large trees that keeps the table and CSV small."
+        )
+        self.matches_chk.setChecked(False)
         self.start_btn = QPushButton("Start Verification")
         self.start_btn.clicked.connect(lambda: self.start())
         self.cancel_btn = QPushButton("Cancel")
@@ -480,6 +487,7 @@ class ChecksumVerifyPanel(QWidget):
         self.sample_spin.setValue(int(job["checksum_sample_pct"]))
         self.job_name = job["name"]
         self.run_id = None
+        self.job_id = job["job_id"]
         idx = self.job_combo.findData(job["job_id"])
         if idx >= 0:
             self.job_combo.blockSignals(True)
@@ -504,6 +512,7 @@ class ChecksumVerifyPanel(QWidget):
             QMessageBox.information(self, APP_TITLE, "Enter a source and destination first.")
             return
         self.run_id = run_id
+        self._started_at = datetime.now(timezone.utc)
         self.model.removeRows(0, self.model.rowCount())
         self.rows = []
         self.counts = None
@@ -515,7 +524,7 @@ class ChecksumVerifyPanel(QWidget):
         self.progress_bar.setFormat("Enumerating files...")
         self.worker = ChecksumWorker(
             self.source, self.dest, self.algo_combo.currentText().lower(),
-            self.threads_spin.value(), self.sample_spin.value(), self.matches_chk.isChecked(),
+            self.threads_spin.value(), self.sample_spin.value(), not self.matches_chk.isChecked(),
         )
         self.worker.log.connect(self.status_label.setText)
         self.worker.row_found.connect(self._on_row)
@@ -568,8 +577,21 @@ class ChecksumVerifyPanel(QWidget):
         self.summary_label.setText(checksum_verify.summarize(counts))
         self.summary_label.setStyleSheet("font-weight: 600; color: %s;" % ("#c62828" if bad else "#2e7d32"))
         self.status_label.setText("")
-        if self.run_id and not counts["cancelled"]:
-            self._attach_to_run(counts)
+        if not counts["cancelled"]:
+            if not self.run_id:
+                # Standalone comparison (not chained to a sync): give it its own
+                # Run History entry so the result and report can be viewed later.
+                try:
+                    bad_n = checksum_verify.problems(counts)
+                    self.run_id = store.record_verification_run(
+                        self.source, self.dest, self._started_at, datetime.now(timezone.utc),
+                        description=checksum_verify.summarize(counts).splitlines()[0],
+                        is_failure=bool(bad_n), job_id=self.job_id,
+                    )
+                except Exception as e:
+                    self.status_label.setText(f"Could not record this verification in Run History: {e}")
+            if self.run_id:
+                self._attach_to_run(counts)
 
     def _write_csv(self, path: str) -> None:
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
@@ -2104,6 +2126,7 @@ class MainWindow(QMainWindow):
         self.source_edit.setText(source)
         self.dest_edit.setText(dest)
         self.checksum_panel.job_name = ""
+        self.checksum_panel.job_id = None
         self.checksum_panel.run_id = None
         if threads:
             self.checksum_panel.threads_spin.setValue(max(1, min(64, int(threads))))
