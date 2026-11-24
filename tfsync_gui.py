@@ -206,7 +206,7 @@ DIFF_TYPES = [
 ]
 
 JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
-               "Auto-Verify ACL", "Enabled", "Run As", "Last Run (local)", "Last Status", "Next Run"]
+               "Auto-Verify ACL", "Auto-Verify Checksum", "Enabled", "Run As", "Last Run (local)", "Last Status", "Next Run"]
 
 JOB_EXPORT_FIELDS = ["name", "source", "dest", "mode", "schedule_expr",
                       "threads", "retries", "auto_verify_acl", "enabled", "run_as_user",
@@ -2387,7 +2387,7 @@ class MainWindow(QMainWindow):
         self.jobs_table.setEditTriggers(QTableView.NoEditTriggers)
         self.jobs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.jobs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.jobs_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Stretch)
+        self.jobs_table.horizontalHeader().setSectionResizeMode(10, QHeaderView.Stretch)
         layout.addWidget(self.jobs_table, 1)
 
         controls = QHBoxLayout()
@@ -2485,6 +2485,10 @@ class MainWindow(QMainWindow):
                 QStandardItem(job["schedule_expr"] or ""),
                 QStandardItem(str(job["threads"])),
                 QStandardItem("Yes" if job["auto_verify_acl"] else "No"),
+                QStandardItem(
+                    (f"Yes ({job['checksum_sample_pct']}%)" if job["checksum_sample_pct"] < 100 else "Yes")
+                    if job["auto_verify_checksum"] else "No"
+                ),
                 QStandardItem("Yes" if job["enabled"] else "No"),
                 QStandardItem(run_as_display),
                 QStandardItem("Running now..." if is_running else format_local_datetime(job.get("last_run_at")) or "Never run"),
