@@ -332,6 +332,11 @@ Ways to run it:
 * **Verify file checksums after a successful sync** (Sync tab checkbox) -
   switches to the Compare Checksums tab and starts automatically after a live manual sync; the
   summary and CSV report are attached to that run in Run History.
+* After **Run Now** the verifications run in the background: the Job Queue
+  header shows `Verifying: N` while they work, each step (started, result or
+  failure reason) is appended to that run's log (**View Log**), and a failure
+  is shown in the Run History column (`FAILED - see log` / `verification_failed`)
+  and in a warning dialog instead of being silent.
 * **Verify file checksums after each successful run** (job editor, with a
   sample %) - runs after scheduled runs and Run Now, in the background. The
   report is saved under `job_reports/<job>_<run>_checksum_report.csv`, the

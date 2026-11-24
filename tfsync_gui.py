@@ -2486,6 +2486,9 @@ class MainWindow(QMainWindow):
         combined_threads = sum(entry["threads"] for entry in self._active_job_runs.values())
         text = (f"Active jobs: {active_count} / {self.max_concurrent_jobs}  |  "
                 f"Combined robocopy threads: {combined_threads}")
+        verifying = len(getattr(self, "_job_acl_workers", []))
+        if verifying:
+            text += f"  |  Verifying: {verifying}"
         if combined_threads > self.thread_warning_threshold:
             text += f"  \u26a0 over warning threshold of {self.thread_warning_threshold} - risk of saturating the link"
             self.active_jobs_label.setStyleSheet(
@@ -3002,81 +3005,121 @@ class MainWindow(QMainWindow):
         self.refresh_history_table()
 
         if job["auto_verify_acl"] and not result["cancelled"] and not robocopy_sync.is_failure(result["exit_code"]):
-            self._start_headless_acl_verify(job, run_id)
+            self._start_headless_acl_verify(job, run_id, entry["log_path"])
         if job["auto_verify_checksum"] and not result["cancelled"] and not robocopy_sync.is_failure(result["exit_code"]):
-            self._start_headless_checksum_verify(job, run_id)
+            self._start_headless_checksum_verify(job, run_id, entry["log_path"])
 
-    def _start_headless_checksum_verify(self, job: dict, run_id: str) -> None:
+    def _chain_log(self, log_path: Optional[str], text: str) -> None:
+        """Appends a timestamped TFSync line to the run's log file, so what the
+        post-run verifications did (or why they failed) is visible via View Log."""
+        if not log_path:
+            return
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] TFSync: {text}\n")
+        except OSError:
+            pass
+
+    def _release_chain_worker(self, worker) -> None:
+        self._job_acl_workers[:] = [w for w in self._job_acl_workers if w is not worker]
+        self._update_active_jobs_label()
+
+    def _start_headless_checksum_verify(self, job: dict, run_id: str, log_path: Optional[str] = None) -> None:
         """Runs checksum verification in the background after a Run Now job and
         attaches its summary + CSV report to the just-recorded run."""
-        report_dir = os.path.join(os.getcwd(), "job_reports")
-        os.makedirs(report_dir, exist_ok=True)
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
-        report_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_checksum_report.csv")
+        try:
+            report_dir = os.path.join(os.getcwd(), "job_reports")
+            os.makedirs(report_dir, exist_ok=True)
+            report_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_checksum_report.csv")
+            csv_file = open(report_path, "w", newline="", encoding="utf-8-sig")
+        except OSError as e:
+            self._chain_log(log_path, f"checksum verification could not start: {e}")
+            store.update_run_checksum_summary(run_id, {"failed": str(e)}, report_path=None)
+            self.refresh_history_table()
+            QMessageBox.warning(self, APP_TITLE, f"Checksum verification for \u201c{job['name']}\u201d could not start:\n{e}")
+            return
 
         worker = ChecksumWorker(job["source"], job["dest"], checksum_verify.DEFAULT_ALGORITHM,
                                 job["threads"], job["checksum_sample_pct"], False)
-        csv_file = open(report_path, "w", newline="", encoding="utf-8-sig")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(checksum_verify.ROW_FIELDS)
-
-        def release() -> None:
-            self._job_acl_workers[:] = [w for w in self._job_acl_workers if w is not worker]
+        self._chain_log(log_path, f"checksum verification started ({job['checksum_sample_pct']}% of files, "
+                                  f"{checksum_verify.DEFAULT_ALGORITHM.upper()}); report: {report_path}")
 
         def on_done(counts: dict) -> None:
             csv_file.close()
-            if not counts["cancelled"]:
+            if counts["cancelled"]:
+                self._chain_log(log_path, "checksum verification cancelled")
+            else:
                 store.update_run_checksum_summary(run_id, checksum_verify.history_summary(counts), report_path=report_path)
+                self._chain_log(log_path, checksum_verify.summarize(counts).replace("\n", " | "))
                 self.refresh_history_table()
-            release()
+            self._release_chain_worker(worker)
 
         def on_fail(message: str) -> None:
             csv_file.close()
-            release()
+            self._chain_log(log_path, f"checksum verification FAILED: {message}")
+            store.update_run_checksum_summary(run_id, {"failed": message}, report_path=None)
+            self.refresh_history_table()
+            self._release_chain_worker(worker)
+            QMessageBox.warning(self, APP_TITLE, f"Checksum verification for \u201c{job['name']}\u201d failed:\n{message}")
 
         worker.row_found.connect(lambda r: csv_writer.writerow([r[k] for k in checksum_verify.ROW_FIELDS]))
         worker.finished_ok.connect(on_done)
         worker.failed.connect(on_fail)
         self._job_acl_workers.append(worker)
+        self._update_active_jobs_label()
         worker.start()
 
-    def _job_failed(self, job_id: str, message: str) -> None:
-        self._active_job_runs.pop(job_id, None)
-        self._update_active_jobs_label()
-        self.refresh_jobs_table()
-        QMessageBox.critical(self, APP_TITLE, f"Job failed to start:\n{message}")
-
-    def _start_headless_acl_verify(self, job: dict, run_id: str) -> None:
+    def _start_headless_acl_verify(self, job: dict, run_id: str, log_path: Optional[str] = None) -> None:
         """Runs an ACL comparison in the background (no table/log wired to the UI) and
         attaches its summary to the just-recorded run once it finishes."""
-        report_dir = os.path.join(os.getcwd(), "job_reports")
-        os.makedirs(report_dir, exist_ok=True)
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
-        report_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_acl_report.csv")
+        try:
+            report_dir = os.path.join(os.getcwd(), "job_reports")
+            os.makedirs(report_dir, exist_ok=True)
+            report_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_acl_report.csv")
+            csv_file = open(report_path, "w", newline="", encoding="utf-8-sig")
+        except OSError as e:
+            self._chain_log(log_path, f"ACL verification could not start: {e}")
+            store.update_run_acl_summary(run_id, {"verification_failed": 1}, report_path=None)
+            self.refresh_history_table()
+            QMessageBox.warning(self, APP_TITLE, f"ACL verification for \u201c{job['name']}\u201d could not start:\n{e}")
+            return
 
+        if os.name == "nt":
+            core.enable_privilege("SeBackupPrivilege", log_cb=lambda m: self._chain_log(log_path, m))
         worker = ScanWorker(job["source"], job["dest"], False, None, job["threads"], False)
-        csv_file = open(report_path, "w", newline="", encoding="utf-8-sig")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(core.ROW_FIELDS)
-
-        def on_row(row: dict) -> None:
-            csv_writer.writerow([row[field] for field in core.ROW_FIELDS])
+        self._chain_log(log_path, f"ACL verification started; report: {report_path}")
 
         def on_done(counts: dict) -> None:
             csv_file.close()
             acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
-            store.update_run_acl_summary(run_id, acl_summary, report_path=report_path)
-            self.refresh_history_table()
-            self._job_acl_workers[:] = [w for w in self._job_acl_workers if w is not worker]
+            if counts.get("cancelled"):
+                self._chain_log(log_path, "ACL verification cancelled")
+            else:
+                store.update_run_acl_summary(run_id, acl_summary, report_path=report_path)
+                self._chain_log(log_path, "ACL verification finished: " +
+                                (", ".join(f"{k}:{v}" for k, v in acl_summary.items() if v and k != "match") or "no differences"))
+                self.refresh_history_table()
+            self._release_chain_worker(worker)
 
         def on_fail(message: str) -> None:
             csv_file.close()
-            self._job_acl_workers[:] = [w for w in self._job_acl_workers if w is not worker]
+            self._chain_log(log_path, f"ACL verification FAILED: {message}")
+            store.update_run_acl_summary(run_id, {"verification_failed": 1}, report_path=None)
+            self.refresh_history_table()
+            self._release_chain_worker(worker)
+            QMessageBox.warning(self, APP_TITLE, f"ACL verification for \u201c{job['name']}\u201d failed:\n{message}")
 
-        worker.row_found.connect(on_row)
+        worker.row_found.connect(lambda row: csv_writer.writerow([row[field] for field in core.ROW_FIELDS]))
         worker.finished_ok.connect(on_done)
         worker.failed.connect(on_fail)
         self._job_acl_workers.append(worker)
+        self._update_active_jobs_label()
         worker.start()
 
     # ---------------------------------------------------------- History tab --
@@ -3243,11 +3286,15 @@ class MainWindow(QMainWindow):
             if run.get("checksum_summary_json"):
                 try:
                     ck = json.loads(run["checksum_summary_json"])
+                    if ck.get("failed"):
+                        raise KeyError("failed")
                     bad = {k: ck.get(k, 0) for k in ("hash_mismatch", "size_mismatch", "missing_in_dest",
                                                       "extra_in_dest", "read_error") if ck.get(k)}
                     ck_col = ", ".join(f"{k}:{v}" for k, v in bad.items()) or f"all {ck.get('matched', 0)} identical"
                     if ck.get("sample_pct", 100) < 100:
                         ck_col += f" ({ck['sample_pct']}% sample)"
+                except KeyError:
+                    ck_col = "FAILED - see log"
                 except (ValueError, TypeError):
                     ck_col = "yes"
             row = [

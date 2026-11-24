@@ -89,48 +89,61 @@ def main() -> int:
 
     is_fail = robocopy_sync.is_failure(result["exit_code"]) and not result["cancelled"]
 
-    if job["auto_verify_acl"] and not result["cancelled"] and not is_fail:
-        report_dir = os.path.join(os.getcwd(), "job_reports")
-        os.makedirs(report_dir, exist_ok=True)
-        report_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_acl_report.csv")
+    chain_ok = not result["cancelled"] and not is_fail   # sync itself succeeded -> run the verifications
 
-        with open(report_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(core.ROW_FIELDS)
+    if job["auto_verify_acl"] and chain_ok:
+        try:
+            core.enable_privilege("SeBackupPrivilege", log_cb=print)
+            report_dir = os.path.join(os.getcwd(), "job_reports")
+            os.makedirs(report_dir, exist_ok=True)
+            report_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_acl_report.csv")
 
-            def row_cb(row: dict) -> None:
-                writer.writerow([row[field] for field in core.ROW_FIELDS])
+            with open(report_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(core.ROW_FIELDS)
 
-            counts = core.compare_trees(
-                job["source"], job["dest"],
-                dirs_only=False, resolve_host=None, max_workers=job["threads"],
-                include_matches=False,
-                log_cb=lambda msg: None, progress_cb=lambda cur, total: None,
-                row_cb=row_cb, should_cancel=lambda: False,
-            )
-        acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
-        store.update_run_acl_summary(run_id, acl_summary, report_path=report_path)
-        print(f"TFSync: chained ACL verification recorded - {acl_summary}")
+                def row_cb(row: dict) -> None:
+                    writer.writerow([row[field] for field in core.ROW_FIELDS])
 
-    if job["auto_verify_checksum"] and not result["cancelled"] and not is_fail:
-        report_dir = os.path.join(os.getcwd(), "job_reports")
-        os.makedirs(report_dir, exist_ok=True)
-        checksum_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_checksum_report.csv")
-        print(f"TFSync: verifying file checksums ({job['checksum_sample_pct']}% of files) ...", flush=True)
-        with open(checksum_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(checksum_verify.ROW_FIELDS)
-            ck_counts = checksum_verify.verify_trees(
-                job["source"], job["dest"], algorithm=checksum_verify.DEFAULT_ALGORITHM,
-                max_workers=job["threads"], sample_pct=job["checksum_sample_pct"],
-                row_cb=lambda r: writer.writerow([r[k] for k in checksum_verify.ROW_FIELDS]),
-                log_cb=lambda m: print(m, flush=True),
-            )
-        store.update_run_checksum_summary(run_id, checksum_verify.history_summary(ck_counts),
-                                          report_path=checksum_path)
-        print("TFSync: checksum verification recorded - " + checksum_verify.summarize(ck_counts).splitlines()[0])
-        if checksum_verify.problems(ck_counts):
-            is_fail = True   # content mismatch is a failed migration check -> non-zero exit for Task Scheduler
+                counts = core.compare_trees(
+                    job["source"], job["dest"],
+                    dirs_only=False, resolve_host=None, max_workers=job["threads"],
+                    include_matches=False,
+                    log_cb=lambda msg: None, progress_cb=lambda cur, total: None,
+                    row_cb=row_cb, should_cancel=lambda: False,
+                )
+            acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
+            store.update_run_acl_summary(run_id, acl_summary, report_path=report_path)
+            print(f"TFSync: chained ACL verification recorded - {acl_summary}")
+        except Exception as e:  # never let a verification crash hide the sync result
+            print(f"TFSync: ACL verification FAILED: {e}", flush=True)
+            store.update_run_acl_summary(run_id, {"verification_failed": 1}, report_path=None)
+            is_fail = True
+
+    if job["auto_verify_checksum"] and chain_ok:
+        try:
+            report_dir = os.path.join(os.getcwd(), "job_reports")
+            os.makedirs(report_dir, exist_ok=True)
+            checksum_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_checksum_report.csv")
+            print(f"TFSync: verifying file checksums ({job['checksum_sample_pct']}% of files) ...", flush=True)
+            with open(checksum_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(checksum_verify.ROW_FIELDS)
+                ck_counts = checksum_verify.verify_trees(
+                    job["source"], job["dest"], algorithm=checksum_verify.DEFAULT_ALGORITHM,
+                    max_workers=job["threads"], sample_pct=job["checksum_sample_pct"],
+                    row_cb=lambda r: writer.writerow([r[k] for k in checksum_verify.ROW_FIELDS]),
+                    log_cb=lambda m: print(m, flush=True),
+                )
+            store.update_run_checksum_summary(run_id, checksum_verify.history_summary(ck_counts),
+                                              report_path=checksum_path)
+            print("TFSync: checksum verification recorded - " + checksum_verify.summarize(ck_counts).splitlines()[0])
+            if checksum_verify.problems(ck_counts):
+                is_fail = True   # content mismatch is a failed migration check -> non-zero exit for Task Scheduler
+        except Exception as e:  # never let a verification crash hide the sync result
+            print(f"TFSync: checksum verification FAILED: {e}", flush=True)
+            store.update_run_checksum_summary(run_id, {"failed": str(e)}, report_path=None)
+            is_fail = True
 
     return 1 if is_fail else 0
 
