@@ -329,6 +329,10 @@ Ways to run it:
   as a `verify` run (copy columns left empty; red if anything differed), with
   its summary in the Checksum Verify column and the report available via
   **View Checksum Report**.
+  The **Difference type** filter in every report table (Compare ACLs, Compare
+  Checksums and the Run History report viewers) has `All`, each specific type
+  (including `MATCH`) and **Not MATCH (differences only)**; it combines with
+  the free-text filter.
 * **Verify file checksums after a successful sync** (Sync tab checkbox) -
   switches to the Compare Checksums tab and starts automatically after a live manual sync; the
   summary and CSV report are attached to that run in Run History.

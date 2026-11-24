@@ -200,8 +200,45 @@ ROW_COLORS = {
     "MATCH": QColor("#d4edda"),
 }
 
+NOT_MATCH_LABEL = "Not MATCH (differences only)"
+
+
+class ReportFilterProxy(QSortFilterProxyModel):
+    """Row filter for comparison reports: a free-text filter (case-insensitive,
+    across all columns) combined with an EXACT Difference-type filter. The type
+    filter accepts a specific type, "All", or NOT_MATCH_LABEL, which hides MATCH
+    rows so only differences remain."""
+
+    def __init__(self, parent=None, type_column: Optional[int] = 2):
+        super().__init__(parent)
+        self._type_col = type_column
+        self._text = ""
+        self._type = "All"
+
+    def set_filters(self, text: str, diff_type: str) -> None:
+        self._text = (text or "").lower()
+        self._type = diff_type or "All"
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent) -> bool:
+        model = self.sourceModel()
+        if self._type_col is not None and self._type != "All":
+            row_type = str(model.index(source_row, self._type_col, source_parent).data() or "")
+            if self._type == NOT_MATCH_LABEL:
+                if row_type == "MATCH":
+                    return False
+            elif row_type != self._type:
+                return False
+        if self._text:
+            return any(
+                self._text in str(model.index(source_row, c, source_parent).data() or "").lower()
+                for c in range(model.columnCount())
+            )
+        return True
+
+
 DIFF_TYPES = [
-    "All", "MISSING_IN_DEST", "EXTRA_IN_DEST", "OWNER_DIFF", "GROUP_DIFF",
+    "All", NOT_MATCH_LABEL, "MISSING_IN_DEST", "EXTRA_IN_DEST", "OWNER_DIFF", "GROUP_DIFF",
     "ACE_MISSING_IN_DEST", "ACE_ADDED_IN_DEST", "READ_ERROR", "MATCH",
 ]
 
@@ -431,17 +468,15 @@ class ChecksumVerifyPanel(QWidget):
         self.filter_edit.setClearButtonEnabled(True)
         filter_row.addWidget(self.filter_edit, 1)
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["All"] + checksum_verify.DIFF_TYPES)
+        self.type_combo.addItems(["All", NOT_MATCH_LABEL] + checksum_verify.DIFF_TYPES)
         filter_row.addWidget(QLabel("Difference type:"))
         filter_row.addWidget(self.type_combo)
         root.addLayout(filter_row)
 
         self.model = QStandardItemModel(0, len(checksum_verify.ROW_FIELDS))
         self.model.setHorizontalHeaderLabels(checksum_verify.ROW_FIELDS)
-        self.proxy = QSortFilterProxyModel(self)
+        self.proxy = ReportFilterProxy(self, type_column=2)
         self.proxy.setSourceModel(self.model)
-        self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
-        self.proxy.setFilterKeyColumn(-1)
         self.filter_edit.textChanged.connect(self._apply_filter)
         self.type_combo.currentTextChanged.connect(self._apply_filter)
         self.table = QTableView()
@@ -500,13 +535,7 @@ class ChecksumVerifyPanel(QWidget):
             self.job_combo.blockSignals(False)
 
     def _apply_filter(self) -> None:
-        kind = self.type_combo.currentText()
-        if kind == "All":
-            self.proxy.setFilterKeyColumn(-1)
-            self.proxy.setFilterFixedString(self.filter_edit.text())
-        else:
-            self.proxy.setFilterKeyColumn(2)
-            self.proxy.setFilterFixedString(kind)
+        self.proxy.set_filters(self.filter_edit.text(), self.type_combo.currentText())
 
     def start(self, run_id: Optional[str] = None) -> None:
         if self.worker and self.worker.isRunning():
@@ -1041,7 +1070,7 @@ class CsvTableViewerDialog(QDialog):
             filter_row.addWidget(QLabel("Difference type:"))
             self.type_combo = QComboBox()
             distinct_types = sorted({row[diff_type_col] for row in data_rows if len(row) > diff_type_col})
-            self.type_combo.addItems(["All"] + distinct_types)
+            self.type_combo.addItems(["All"] + ([NOT_MATCH_LABEL] if "MATCH" in distinct_types else []) + distinct_types)
             self.type_combo.currentTextChanged.connect(self._apply_filter)
             filter_row.addWidget(self.type_combo)
         layout.addLayout(filter_row)
@@ -1053,10 +1082,8 @@ class CsvTableViewerDialog(QDialog):
             _apply_cell_tooltips(items)
             self.model.appendRow(items)
 
-        self.proxy = QSortFilterProxyModel()
+        self.proxy = ReportFilterProxy(type_column=diff_type_col)
         self.proxy.setSourceModel(self.model)
-        self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
-        self.proxy.setFilterKeyColumn(-1)
 
         self.table = QTableView()
         self.table.setModel(self.proxy)
@@ -1089,18 +1116,7 @@ class CsvTableViewerDialog(QDialog):
         self.resize(min(1000, int(screen.width() * 0.9)), min(700, int(screen.height() * 0.85)))
 
     def _apply_filter(self) -> None:
-        text = self.filter_edit.text()
-        diff_type = self.type_combo.currentText() if self.type_combo else "All"
-
-        if diff_type == "All" or self._diff_type_col is None:
-            self.proxy.setFilterFixedString(text)
-            self.proxy.setFilterKeyColumn(-1)
-        else:
-            pattern = re.escape(diff_type)
-            if text:
-                pattern = f"(?=.*{re.escape(diff_type)})(?=.*{re.escape(text)})"
-            self.proxy.setFilterKeyColumn(-1)
-            self.proxy.setFilterRegExp(pattern)
+        self.proxy.set_filters(self.filter_edit.text(), self.type_combo.currentText() if self.type_combo else "All")
         self._update_row_count_label()
 
     def _update_row_count_label(self) -> None:
@@ -2350,10 +2366,8 @@ class MainWindow(QMainWindow):
 
         self.model = QStandardItemModel(0, len(core.ROW_FIELDS))
         self.model.setHorizontalHeaderLabels(core.ROW_FIELDS)
-        self.proxy = QSortFilterProxyModel()
+        self.proxy = ReportFilterProxy(type_column=2)
         self.proxy.setSourceModel(self.model)
-        self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
-        self.proxy.setFilterKeyColumn(-1)  # search across all columns
 
         self.table = QTableView()
         self.table.setModel(self.proxy)
@@ -3748,23 +3762,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, APP_TITLE, f"Scan failed:\n{message}")
 
     def apply_filter(self) -> None:
-        text = self.filter_edit.text()
-        diff_type = self.type_combo.currentText()
-
-        if diff_type == "All":
-            self.proxy.setFilterFixedString(text)
-            self.proxy.setFilterKeyColumn(-1)
-        else:
-            # Filter to rows matching the chosen DifferenceType column exactly,
-            # then further narrow by the free-text filter across all columns.
-            # QSortFilterProxyModel only supports one regex filter at a time,
-            # so we combine both into a single regex against the whole row.
-            import re
-            pattern = re.escape(diff_type)
-            if text:
-                pattern = f"(?=.*{re.escape(diff_type)})(?=.*{re.escape(text)})"
-            self.proxy.setFilterKeyColumn(-1)
-            self.proxy.setFilterRegExp(pattern if text else re.escape(diff_type))
+        self.proxy.set_filters(self.filter_edit.text(), self.type_combo.currentText())
 
     def _apply_theme(self) -> None:
         app = QApplication.instance()
