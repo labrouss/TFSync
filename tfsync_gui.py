@@ -3235,7 +3235,7 @@ class MainWindow(QMainWindow):
             if run["acl_chained"]:
                 try:
                     summary = json.loads(run["acl_summary_json"]) if run["acl_summary_json"] else {}
-                    acl_col = ", ".join(f"{k}:{v}" for k, v in summary.items() if v)
+                    acl_col = ", ".join(f"{k}:{v}" for k, v in summary.items() if v and k != "match")
                     acl_col = acl_col or "no differences"
                 except (ValueError, TypeError):
                     acl_col = "yes"
@@ -3550,6 +3550,8 @@ class MainWindow(QMainWindow):
         self.open_report_btn.setEnabled(False)
         self.view_csv_btn.setEnabled(False)
         self.last_output_path = output
+        self._acl_started_at = datetime.now(timezone.utc)
+        self._acl_source, self._acl_dest = source, dest
 
         self._csv_file = open(output, "w", newline="", encoding="utf-8-sig")
         self._csv_writer = csv.writer(self._csv_file)
@@ -3626,11 +3628,31 @@ class MainWindow(QMainWindow):
         self.summary_label.setText(summary)
         self.append_log(f"\n=== Done ===\n{summary}\nReport saved to: {self.last_output_path}")
 
+        acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
         if self._pending_acl_chain_run_id:
-            acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
             store.update_run_acl_summary(self._pending_acl_chain_run_id, acl_summary, report_path=self.last_output_path)
             self._pending_acl_chain_run_id = None
             self.refresh_history_table()
+        elif not counts.get("cancelled"):
+            # Standalone ACL comparison (not chained to a sync): record it in Run
+            # History as its own 'verify' run so its summary and report can be viewed later.
+            try:
+                problems = sum(int(counts.get(k, 0)) for k in
+                               ("missing", "extra", "owner_diff", "group_diff", "ace_diff", "error"))
+                job_id = self.compare_job_combo.currentData()
+                job = store.get_job(job_id) if job_id else None
+                if not job or (job["source"], job["dest"]) != (self._acl_source, self._acl_dest):
+                    job_id = None   # fields were edited after loading the job - not that job's comparison
+                run_id = store.record_verification_run(
+                    self._acl_source, self._acl_dest, self._acl_started_at, datetime.now(timezone.utc),
+                    description=("ACL comparison: %d difference(s) found" % problems) if problems
+                                else "ACL comparison: no differences",
+                    is_failure=bool(problems), job_id=job_id,
+                )
+                store.update_run_acl_summary(run_id, acl_summary, report_path=self.last_output_path)
+                self.refresh_history_table()
+            except Exception as e:
+                self.append_log(f"Could not record this comparison in Run History: {e}")
 
     def scan_failed(self, message: str) -> None:
         try:
