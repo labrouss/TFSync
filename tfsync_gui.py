@@ -39,6 +39,7 @@ from PyQt5.QtWidgets import (
 
 import acl_compare_core as core
 import long_path_scan
+import checksum_verify
 import robocopy_sync
 import tfsync_store as store
 import task_scheduler
@@ -209,11 +210,12 @@ JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
 
 JOB_EXPORT_FIELDS = ["name", "source", "dest", "mode", "schedule_expr",
                       "threads", "retries", "auto_verify_acl", "enabled", "run_as_user",
-                      "source_username", "dest_username", "long_paths"]
+                      "source_username", "dest_username", "long_paths",
+                      "auto_verify_checksum", "checksum_sample_pct"]
 
 HISTORY_COLUMNS = ["Start Time (local)", "Job", "Source", "Destination", "Mode", "Dry Run",
                     "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
-                    "Description", "ACL Chained"]
+                    "Description", "ACL Chained", "Checksum Verify"]
 
 
 def format_bytes_human(num_bytes: Optional[int]) -> str:
@@ -300,6 +302,282 @@ class ScanWorker(QThread):
             self.finished_ok.emit(counts)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class ChecksumWorker(QThread):
+    row_found = pyqtSignal(dict)
+    progress = pyqtSignal(int, int, int, int)   # files_done, files_total, bytes_done, bytes_total
+    log = pyqtSignal(str)
+    finished_ok = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, source: str, dest: str, algorithm: str, threads: int,
+                 sample_pct: int, include_matches: bool):
+        super().__init__()
+        self.source, self.dest = source, dest
+        self.algorithm, self.threads = algorithm, threads
+        self.sample_pct, self.include_matches = sample_pct, include_matches
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            counts = checksum_verify.verify_trees(
+                self.source, self.dest, algorithm=self.algorithm, max_workers=self.threads,
+                sample_pct=self.sample_pct, include_matches=self.include_matches,
+                log_cb=self.log.emit, progress_cb=self.progress.emit,
+                row_cb=self.row_found.emit, should_cancel=lambda: self._cancel,
+            )
+            self.finished_ok.emit(counts)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class ChecksumVerifyDialog(QDialog):
+    """
+    Content verification after a sync: hashes every file in the source and
+    destination (SHA-256 by default) and lists anything that differs. robocopy
+    never compares file contents, so this is the data-integrity counterpart to
+    the ACL comparison. When opened for a recorded run (run_id), the summary
+    and CSV report are attached to that run in Run History automatically.
+    """
+
+    def __init__(self, parent, source: str, dest: str, threads: int = 8, sample_pct: int = 100,
+                 job_name: str = "", run_id: Optional[str] = None, auto_start: bool = False):
+        super().__init__(parent)
+        self._parent_window = parent
+        self.source, self.dest, self.run_id = source, dest, run_id
+        self.job_name = job_name
+        self.rows: List[dict] = []
+        self.counts: Optional[dict] = None
+        self.worker: Optional[ChecksumWorker] = None
+        self.setWindowTitle("Verify Checksums" + (f" - {job_name}" if job_name else ""))
+        self.setWindowModality(Qt.NonModal)
+        self.resize(980, 680)
+
+        root = QVBoxLayout(self)
+        note = QLabel(
+            "robocopy never compares file contents. This hashes every file on BOTH sides and "
+            "compares the digests, so it reads all data from source and destination again - on "
+            "large migrations use a sample, or run it on a host close to the storage."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #999; font-style: italic;")
+        root.addWidget(note)
+
+        box = QGroupBox("Verification")
+        form = QFormLayout(box)
+        for label, text in (("Source:", source), ("Destination:", dest)):
+            lbl = QLabel(text)
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            form.addRow(label, lbl)
+
+        opts = QHBoxLayout()
+        self.algo_combo = QComboBox()
+        self.algo_combo.addItems([a.upper() for a in checksum_verify.ALGORITHMS])
+        self.algo_combo.setToolTip("Hash algorithm. SHA-256 is the default; MD5/SHA-1 are faster but weaker.")
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(1, 64)
+        self.threads_spin.setValue(max(1, min(64, threads)))
+        self.threads_spin.setToolTip("Files hashed in parallel (each file is read from both sides).")
+        self.sample_spin = QSpinBox()
+        self.sample_spin.setRange(1, 100)
+        self.sample_spin.setSuffix(" %")
+        self.sample_spin.setValue(sample_pct)
+        self.sample_spin.setToolTip(
+            "Percentage of files to verify. The sample is deterministic (the same files are chosen "
+            "every time). Below 100% extra files in the destination are not reported."
+        )
+        self.matches_chk = QCheckBox("Include identical files in report")
+        self.matches_chk.setToolTip("Adds a MATCH row with the digest for every verified file. Makes the report large.")
+        self.start_btn = QPushButton("Start Verification")
+        self.start_btn.clicked.connect(self.start)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel)
+        for w in (QLabel("Algorithm:"), self.algo_combo, QLabel("Threads:"), self.threads_spin,
+                  QLabel("Sample:"), self.sample_spin, self.matches_chk):
+            opts.addWidget(w)
+        opts.addStretch()
+        opts.addWidget(self.start_btn)
+        opts.addWidget(self.cancel_btn)
+        form.addRow(opts)
+        root.addWidget(box)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setFormat("Idle")
+        root.addWidget(self.progress_bar)
+        self.status_label = QLabel("")
+        root.addWidget(self.status_label)
+        self.summary_label = QLabel("")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet("font-weight: 600;")
+        root.addWidget(self.summary_label)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Type to filter by path or detail...")
+        self.filter_edit.setClearButtonEnabled(True)
+        filter_row.addWidget(self.filter_edit, 1)
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["All"] + checksum_verify.DIFF_TYPES)
+        filter_row.addWidget(QLabel("Difference type:"))
+        filter_row.addWidget(self.type_combo)
+        root.addLayout(filter_row)
+
+        self.model = QStandardItemModel(0, len(checksum_verify.ROW_FIELDS))
+        self.model.setHorizontalHeaderLabels(checksum_verify.ROW_FIELDS)
+        self.proxy = QSortFilterProxyModel(self)
+        self.proxy.setSourceModel(self.model)
+        self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.proxy.setFilterKeyColumn(-1)
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        self.type_combo.currentTextChanged.connect(self._apply_filter)
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableView.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 380)
+        self.table.setColumnWidth(3, 260)
+        root.addWidget(self.table, 1)
+
+        btns = QHBoxLayout()
+        self.export_btn = QPushButton("Export CSV...")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_csv)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btns.addWidget(self.export_btn)
+        btns.addStretch()
+        btns.addWidget(close_btn)
+        root.addLayout(btns)
+
+        if auto_start:
+            QTimer.singleShot(0, self.start)
+
+    def _apply_filter(self) -> None:
+        kind = self.type_combo.currentText()
+        if kind == "All":
+            self.proxy.setFilterKeyColumn(-1)
+            self.proxy.setFilterFixedString(self.filter_edit.text())
+        else:
+            self.proxy.setFilterKeyColumn(2)
+            self.proxy.setFilterFixedString(kind)
+
+    def start(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        self.model.removeRows(0, self.model.rowCount())
+        self.rows = []
+        self.counts = None
+        self.summary_label.setText("")
+        self.export_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Enumerating files...")
+        self.worker = ChecksumWorker(
+            self.source, self.dest, self.algo_combo.currentText().lower(),
+            self.threads_spin.value(), self.sample_spin.value(), self.matches_chk.isChecked(),
+        )
+        self.worker.log.connect(self.status_label.setText)
+        self.worker.row_found.connect(self._on_row)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished_ok.connect(self._on_done)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.start()
+
+    def cancel(self) -> None:
+        if self.worker:
+            self.worker.cancel()
+            self.progress_bar.setFormat("Cancelling...")
+
+    def _on_row(self, row: dict) -> None:
+        self.rows.append(row)
+        items = [QStandardItem(str(row[k])) for k in checksum_verify.ROW_FIELDS]
+        _apply_cell_tooltips(items)
+        color = {"HASH_MISMATCH": "#f8d7da", "SIZE_MISMATCH": "#f8d7da", "MISSING_IN_DEST": "#f8d7da",
+                 "EXTRA_IN_DEST": "#ffe5b4", "READ_ERROR": "#e2e3e5", "MATCH": "#d4edda"}.get(row["DifferenceType"])
+        if color:
+            for it in items:
+                it.setBackground(QBrush(QColor(color)))
+                it.setForeground(QBrush(QColor("#1a1a1a")))
+        self.model.appendRow(items)
+
+    def _on_progress(self, files_done: int, files_total: int, bytes_done: int, bytes_total: int) -> None:
+        if bytes_total > 0:
+            self.progress_bar.setValue(int(bytes_done * 1000 / bytes_total))
+        elif files_total:
+            self.progress_bar.setValue(int(files_done * 1000 / files_total))
+        self.progress_bar.setFormat(
+            f"{files_done:,} / {files_total:,} files  ({format_bytes_human(bytes_done)} of {format_bytes_human(bytes_total)})"
+        )
+
+    def _on_failed(self, message: str) -> None:
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setFormat("Failed")
+        QMessageBox.critical(self, APP_TITLE, f"Checksum verification failed:\n{message}")
+
+    def _on_done(self, counts: dict) -> None:
+        self.counts = counts
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.export_btn.setEnabled(True)
+        self.progress_bar.setFormat("Cancelled (partial)" if counts["cancelled"] else "Complete")
+        if not counts["cancelled"]:
+            self.progress_bar.setValue(1000)
+        bad = checksum_verify.problems(counts)
+        self.summary_label.setText(checksum_verify.summarize(counts))
+        self.summary_label.setStyleSheet("font-weight: 600; color: %s;" % ("#c62828" if bad else "#2e7d32"))
+        self.status_label.setText("")
+        if self.run_id and not counts["cancelled"]:
+            self._attach_to_run(counts)
+
+    def _write_csv(self, path: str) -> None:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(checksum_verify.ROW_FIELDS)
+            for r in self.rows:
+                w.writerow([r[k] for k in checksum_verify.ROW_FIELDS])
+
+    def _attach_to_run(self, counts: dict) -> None:
+        try:
+            report_dir = os.path.join(os.getcwd(), "job_reports")
+            os.makedirs(report_dir, exist_ok=True)
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in (self.job_name or "manual"))
+            path = os.path.join(report_dir, f"{safe}_{self.run_id[:8]}_checksum_report.csv")
+            self._write_csv(path)
+            store.update_run_checksum_summary(self.run_id, checksum_verify.history_summary(counts), report_path=path)
+            if hasattr(self._parent_window, "refresh_history_table"):
+                self._parent_window.refresh_history_table()
+            self.status_label.setText(f"Attached to Run History. Report: {path}")
+        except Exception as e:
+            self.status_label.setText(f"Could not attach result to Run History: {e}")
+
+    def export_csv(self) -> None:
+        default = os.path.join(os.getcwd(), "checksum_report.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Checksum Report", default, "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            self._write_csv(path)
+        except OSError as e:
+            QMessageBox.critical(self, APP_TITLE, f"Could not write {path}:\n{e}")
+            return
+        QMessageBox.information(self, APP_TITLE, f"Exported {len(self.rows):,} rows to\n{path}")
+
+    def closeEvent(self, event) -> None:
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.worker.wait(5000)
+        super().closeEvent(event)
 
 
 class LongPathScanWorker(QThread):
@@ -1266,6 +1544,26 @@ class JobEditorDialog(QDialog):
         self.long_paths_chk.setChecked(bool(job["long_paths"]) if job and "long_paths" in job.keys() else False)
         form.addRow("", self.long_paths_chk)
 
+        checksum_row = QHBoxLayout()
+        self.auto_checksum_chk = QCheckBox("Verify file checksums (SHA-256) after each successful run")
+        self.auto_checksum_chk.setToolTip(
+            "After a successful (non-dry-run, non-cancelled) sync, hashes files on both sides and "
+            "attaches the result to this run's history entry - report saved under job_reports/. "
+            "robocopy never compares content, so this is the data-integrity check. Reads all verified "
+            "data from both shares, so large jobs may want a sample. A mismatch makes a scheduled run "
+            "exit non-zero."
+        )
+        self.auto_checksum_chk.setChecked(bool(job["auto_verify_checksum"]) if job and "auto_verify_checksum" in job.keys() else False)
+        self.checksum_sample_spin = QSpinBox()
+        self.checksum_sample_spin.setRange(1, 100)
+        self.checksum_sample_spin.setSuffix(" % of files")
+        self.checksum_sample_spin.setValue(int(job["checksum_sample_pct"]) if job and "checksum_sample_pct" in job.keys() else 100)
+        self.checksum_sample_spin.setToolTip("Deterministic sample - 100% verifies every file.")
+        checksum_row.addWidget(self.auto_checksum_chk)
+        checksum_row.addWidget(self.checksum_sample_spin)
+        checksum_row.addStretch()
+        form.addRow("", checksum_row)
+
         self.auto_verify_chk = QCheckBox("Automatically run ACL comparison after each successful run")
         self.auto_verify_chk.setToolTip(
             "After a successful (non-dry-run, non-cancelled) sync, automatically runs an "
@@ -1473,6 +1771,8 @@ class JobEditorDialog(QDialog):
             "retries": self.retries_spin.value(),
             "auto_verify_acl": self.auto_verify_chk.isChecked(),
             "long_paths": self.long_paths_chk.isChecked(),
+            "auto_verify_checksum": self.auto_checksum_chk.isChecked(),
+            "checksum_sample_pct": self.checksum_sample_spin.value(),
             "enabled": self.enabled_chk.isChecked(),
             "run_as_user": self.runas_user_edit.text().strip() if self.runas_stored_radio.isChecked() else None,
             "source_username": self.source_cred_user_edit.text().strip() if self.source_creds_chk.isChecked() else None,
@@ -1620,6 +1920,14 @@ class MainWindow(QMainWindow):
         )
         form.addRow("", self.sync_long_paths_chk)
 
+        self.sync_verify_checksum_chk = QCheckBox("Verify file checksums (SHA-256) after a successful sync")
+        self.sync_verify_checksum_chk.setToolTip(
+            "When a live sync completes, opens the checksum verification window and starts it "
+            "automatically; the result is attached to this run in Run History. robocopy never "
+            "compares file content, so this is the data-integrity check."
+        )
+        form.addRow("", self.sync_verify_checksum_chk)
+
         self.sync_threads_spin = QSpinBox()
         self.sync_threads_spin.setRange(1, 128)
         self.sync_threads_spin.setValue(16)
@@ -1689,6 +1997,13 @@ class MainWindow(QMainWindow):
         )
         self.scan_long_paths_btn.clicked.connect(self.on_scan_long_paths)
         controls.addWidget(self.scan_long_paths_btn)
+        self.verify_checksums_btn = QPushButton("Verify Checksums...")
+        self.verify_checksums_btn.setToolTip(
+            "Hash every file in the source and destination (SHA-256) and list any that differ, "
+            "are missing or extra - the content check robocopy does not do."
+        )
+        self.verify_checksums_btn.clicked.connect(self.on_verify_checksums)
+        controls.addWidget(self.verify_checksums_btn)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -1736,6 +2051,7 @@ class MainWindow(QMainWindow):
             "threads": self.sync_threads_spin.value(),
             "retries": self.sync_retries_spin.value(),
             "long_paths": self.sync_long_paths_chk.isChecked(),
+            "auto_verify_checksum": self.sync_verify_checksum_chk.isChecked(),
             "auto_verify_acl": False,
             "enabled": True,
             "schedule_expr": "daily@02:00",  # sensible starting point - the whole point of this button is to add one
@@ -1749,6 +2065,33 @@ class MainWindow(QMainWindow):
             self.refresh_jobs_table()
             self._sync_job_schedule(job_id, password=password)
             self.tabs.setCurrentIndex(2)  # Job Queue tab
+
+    def _open_checksum_dialog(self, source: str, dest: str, threads: int = 8, sample_pct: int = 100,
+                              job_name: str = "", run_id: Optional[str] = None, auto_start: bool = False) -> None:
+        dialog = ChecksumVerifyDialog(self, source, dest, threads=threads, sample_pct=sample_pct,
+                                      job_name=job_name, run_id=run_id, auto_start=auto_start)
+        if not hasattr(self, "_checksum_dialogs"):
+            self._checksum_dialogs = []
+        self._checksum_dialogs.append(dialog)   # non-modal: keep a reference
+        dialog.show()
+
+    def on_verify_checksums(self) -> None:
+        source = self.source_edit.text().strip()
+        dest = self.dest_edit.text().strip()
+        if not source or not dest:
+            QMessageBox.information(self, APP_TITLE, "Enter a source and destination first.")
+            return
+        self._open_checksum_dialog(source, dest, threads=self.sync_threads_spin.value())
+
+    def on_verify_job_checksums(self) -> None:
+        job_id = self._selected_job_id()
+        if not job_id:
+            QMessageBox.information(self, APP_TITLE, "Select a job to verify first.")
+            return
+        job = store.get_job(job_id)
+        if job:
+            self._open_checksum_dialog(job["source"], job["dest"], threads=job["threads"],
+                                       sample_pct=job["checksum_sample_pct"], job_name=job["name"])
 
     def on_scan_long_paths(self) -> None:
         source = self.source_edit.text().strip()
@@ -2035,6 +2378,9 @@ class MainWindow(QMainWindow):
         scan_lp_btn = QPushButton("Scan Long Paths...")
         scan_lp_btn.setToolTip("Scan the selected job's source for paths of 260+ characters and check the host's LongPathsEnabled setting")
         scan_lp_btn.clicked.connect(self.on_scan_job_long_paths)
+        verify_ck_btn = QPushButton("Verify Checksums...")
+        verify_ck_btn.setToolTip("Hash the selected job's source and destination (SHA-256) and list any differences")
+        verify_ck_btn.clicked.connect(self.on_verify_job_checksums)
         sync_schedules_btn = QPushButton("Sync Schedules Now")
         sync_schedules_btn.setToolTip(
             "Reconciles Task Scheduler with the jobs database: registers/updates enabled "
@@ -2057,6 +2403,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(live_log_btn)
         controls.addWidget(compare_btn)
         controls.addWidget(scan_lp_btn)
+        controls.addWidget(verify_ck_btn)
         controls.addWidget(sync_schedules_btn)
         controls.addWidget(export_jobs_btn)
         controls.addWidget(import_jobs_btn)
@@ -2413,6 +2760,8 @@ class MainWindow(QMainWindow):
             "source_username": source_username,
             "dest_username": dest_username,
             "long_paths": bool(entry.get("long_paths", False)),
+            "auto_verify_checksum": bool(entry.get("auto_verify_checksum", False)),
+            "checksum_sample_pct": max(1, min(100, int(entry.get("checksum_sample_pct", 100) or 100))),
         }
 
     def on_import_jobs(self) -> None:
@@ -2588,6 +2937,42 @@ class MainWindow(QMainWindow):
 
         if job["auto_verify_acl"] and not result["cancelled"] and not robocopy_sync.is_failure(result["exit_code"]):
             self._start_headless_acl_verify(job, run_id)
+        if job["auto_verify_checksum"] and not result["cancelled"] and not robocopy_sync.is_failure(result["exit_code"]):
+            self._start_headless_checksum_verify(job, run_id)
+
+    def _start_headless_checksum_verify(self, job: dict, run_id: str) -> None:
+        """Runs checksum verification in the background after a Run Now job and
+        attaches its summary + CSV report to the just-recorded run."""
+        report_dir = os.path.join(os.getcwd(), "job_reports")
+        os.makedirs(report_dir, exist_ok=True)
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job["name"])
+        report_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_checksum_report.csv")
+
+        worker = ChecksumWorker(job["source"], job["dest"], checksum_verify.DEFAULT_ALGORITHM,
+                                job["threads"], job["checksum_sample_pct"], False)
+        csv_file = open(report_path, "w", newline="", encoding="utf-8-sig")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(checksum_verify.ROW_FIELDS)
+
+        def release() -> None:
+            self._job_acl_workers[:] = [w for w in self._job_acl_workers if w is not worker]
+
+        def on_done(counts: dict) -> None:
+            csv_file.close()
+            if not counts["cancelled"]:
+                store.update_run_checksum_summary(run_id, checksum_verify.history_summary(counts), report_path=report_path)
+                self.refresh_history_table()
+            release()
+
+        def on_fail(message: str) -> None:
+            csv_file.close()
+            release()
+
+        worker.row_found.connect(lambda r: csv_writer.writerow([r[k] for k in checksum_verify.ROW_FIELDS]))
+        worker.finished_ok.connect(on_done)
+        worker.failed.connect(on_fail)
+        self._job_acl_workers.append(worker)
+        worker.start()
 
     def _job_failed(self, job_id: str, message: str) -> None:
         self._active_job_runs.pop(job_id, None)
@@ -2677,6 +3062,10 @@ class MainWindow(QMainWindow):
         view_acl_btn.setToolTip("Open the selected run's chained ACL comparison in a sortable/filterable table, if it has one")
         view_acl_btn.clicked.connect(self.on_view_selected_acl_report)
         filter_row.addWidget(view_acl_btn)
+        view_ck_btn = QPushButton("View Checksum Report")
+        view_ck_btn.setToolTip("Open the selected run's checksum verification report in a sortable/filterable table, if it has one")
+        view_ck_btn.clicked.connect(self.on_view_selected_checksum_report)
+        filter_row.addWidget(view_ck_btn)
         delete_selected_btn = QPushButton("Delete Selected")
         delete_selected_btn.setToolTip("Delete the selected run(s) from history (Ctrl/Shift-click to select multiple)")
         delete_selected_btn.clicked.connect(self.on_delete_selected_history)
@@ -2784,6 +3173,17 @@ class MainWindow(QMainWindow):
                     acl_col = acl_col or "no differences"
                 except (ValueError, TypeError):
                     acl_col = "yes"
+            ck_col = "\u2014"
+            if run.get("checksum_summary_json"):
+                try:
+                    ck = json.loads(run["checksum_summary_json"])
+                    bad = {k: ck.get(k, 0) for k in ("hash_mismatch", "size_mismatch", "missing_in_dest",
+                                                      "extra_in_dest", "read_error") if ck.get(k)}
+                    ck_col = ", ".join(f"{k}:{v}" for k, v in bad.items()) or f"all {ck.get('matched', 0)} identical"
+                    if ck.get("sample_pct", 100) < 100:
+                        ck_col += f" ({ck['sample_pct']}% sample)"
+                except (ValueError, TypeError):
+                    ck_col = "yes"
             row = [
                 QStandardItem(format_local_datetime(run["start_time"])),
                 QStandardItem(job_name),
@@ -2798,6 +3198,7 @@ class MainWindow(QMainWindow):
                 QStandardItem(str(run["exit_code"])),
                 QStandardItem(run["description"]),
                 QStandardItem(acl_col),
+                QStandardItem(ck_col),
             ]
             row[0].setData(run["run_id"], Qt.UserRole)
             _apply_cell_tooltips(row)
@@ -3008,6 +3409,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, APP_TITLE,
                 f"Sync finished with errors:\n{result['description']}\n\nCheck the log for details."
+            )
+
+        if (not dry_run and not result["cancelled"] and self.sync_verify_checksum_chk.isChecked()
+                and not robocopy_sync.is_failure(result["exit_code"])):
+            self._open_checksum_dialog(
+                self._sync_source, self._sync_dest, threads=self.sync_threads_spin.value(),
+                run_id=self._last_manual_run_id, auto_start=True,
             )
 
         # Only offer to chain into the ACL comparison for a real (non-preview,
@@ -3279,6 +3687,20 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_TITLE, "This run didn't have an ACL comparison chained to it.")
             return
         self._open_csv_table_viewer(run.get("acl_report_path"), "ACL Comparison Report", "This run's ACL comparison report")
+
+    def on_view_selected_checksum_report(self) -> None:
+        run_id = self._selected_history_run_id()
+        if not run_id:
+            QMessageBox.information(self, APP_TITLE, "Select a run in the table first.")
+            return
+        run = store.get_run(run_id)
+        if not run:
+            return
+        if not run.get("checksum_summary_json"):
+            QMessageBox.information(self, APP_TITLE, "This run didn't have a checksum verification attached to it.")
+            return
+        self._open_csv_table_viewer(run.get("checksum_report_path"), "Checksum Verification Report",
+                                    "This run's checksum report")
 
     def _selected_history_run_id(self) -> Optional[str]:
         selection_model = self.history_table.selectionModel()

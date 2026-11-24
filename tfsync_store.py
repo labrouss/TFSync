@@ -175,6 +175,14 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN source_username TEXT")
     if "dest_username" not in jobs_cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN dest_username TEXT")
+    if "auto_verify_checksum" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN auto_verify_checksum INTEGER NOT NULL DEFAULT 0")
+    if "checksum_sample_pct" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN checksum_sample_pct INTEGER NOT NULL DEFAULT 100")
+    if "checksum_summary_json" not in run_history_cols:
+        conn.execute("ALTER TABLE run_history ADD COLUMN checksum_summary_json TEXT")
+    if "checksum_report_path" not in run_history_cols:
+        conn.execute("ALTER TABLE run_history ADD COLUMN checksum_report_path TEXT")
     if "long_paths" not in jobs_cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN long_paths INTEGER NOT NULL DEFAULT 0")
     if "last_run_at" not in jobs_cols:
@@ -199,6 +207,8 @@ def create_job(
     source_username: Optional[str] = None,
     dest_username: Optional[str] = None,
     long_paths: bool = False,
+    auto_verify_checksum: bool = False,
+    checksum_sample_pct: int = 100,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> str:
     """Creates a job definition and returns its job_id."""
@@ -209,11 +219,12 @@ def create_job(
             """INSERT INTO jobs
                (job_id, name, source, dest, mode, schedule_expr, threads,
                 retries, auto_verify_acl, enabled, run_as_user, source_username,
-                dest_username, long_paths, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                dest_username, long_paths, auto_verify_checksum, checksum_sample_pct, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, name, source, dest, mode, schedule_expr, threads,
              retries, int(auto_verify_acl), int(enabled), run_as_user or None,
-             source_username or None, dest_username or None, int(long_paths), now, now),
+             source_username or None, dest_username or None, int(long_paths),
+             int(auto_verify_checksum), int(checksum_sample_pct), now, now),
         )
     return job_id
 
@@ -449,6 +460,21 @@ def update_run_acl_summary(
         conn.execute(
             "UPDATE run_history SET acl_chained = 1, acl_summary_json = ?, acl_report_path = ? WHERE run_id = ?",
             (json.dumps(acl_summary), report_path, run_id),
+        )
+
+
+def update_run_checksum_summary(
+    run_id: str,
+    checksum_summary: Dict[str, Any],
+    report_path: Optional[str] = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """Attaches a chained checksum-verification summary (and the path to its
+    CSV report) to an already-recorded run."""
+    with _connect(db_path) as conn:
+        conn.execute(
+            "UPDATE run_history SET checksum_summary_json = ?, checksum_report_path = ? WHERE run_id = ?",
+            (json.dumps(checksum_summary), report_path, run_id),
         )
 
 

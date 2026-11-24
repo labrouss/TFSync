@@ -25,6 +25,7 @@ import uuid
 from datetime import datetime, timezone
 
 import acl_compare_core as core
+import checksum_verify
 import robocopy_sync
 import tfsync_store as store
 
@@ -110,6 +111,26 @@ def main() -> int:
         acl_summary = {k: v for k, v in counts.items() if k != "cancelled"}
         store.update_run_acl_summary(run_id, acl_summary, report_path=report_path)
         print(f"TFSync: chained ACL verification recorded - {acl_summary}")
+
+    if job["auto_verify_checksum"] and not result["cancelled"] and not is_fail:
+        report_dir = os.path.join(os.getcwd(), "job_reports")
+        os.makedirs(report_dir, exist_ok=True)
+        checksum_path = os.path.join(report_dir, f"{safe_name}_{run_id[:8]}_checksum_report.csv")
+        print(f"TFSync: verifying file checksums ({job['checksum_sample_pct']}% of files) ...", flush=True)
+        with open(checksum_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(checksum_verify.ROW_FIELDS)
+            ck_counts = checksum_verify.verify_trees(
+                job["source"], job["dest"], algorithm=checksum_verify.DEFAULT_ALGORITHM,
+                max_workers=job["threads"], sample_pct=job["checksum_sample_pct"],
+                row_cb=lambda r: writer.writerow([r[k] for k in checksum_verify.ROW_FIELDS]),
+                log_cb=lambda m: print(m, flush=True),
+            )
+        store.update_run_checksum_summary(run_id, checksum_verify.history_summary(ck_counts),
+                                          report_path=checksum_path)
+        print("TFSync: checksum verification recorded - " + checksum_verify.summarize(ck_counts).splitlines()[0])
+        if checksum_verify.problems(ck_counts):
+            is_fail = True   # content mismatch is a failed migration check -> non-zero exit for Task Scheduler
 
     return 1 if is_fail else 0
 

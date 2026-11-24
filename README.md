@@ -301,6 +301,48 @@ only ever print "this must run on Windows."
   Description, or ACE detail to read it in full. Every input field across
   the app (Sync, Compare, and the Job Editor) has an explanatory tooltip too.
 
+## Checksum verification (data integrity)
+
+robocopy decides what to copy from file size and timestamp and **never
+compares file content**, so a clean robocopy exit does not prove the bytes
+match. The ACL comparison verifies permissions, not data. TFSync's checksum
+verification closes that gap by hashing every file on **both** sides
+(SHA-256 by default; SHA-1/SHA-512/MD5 selectable) and comparing digests.
+
+Per file: destination missing -> `MISSING_IN_DEST`; sizes differ ->
+`SIZE_MISMATCH` (no hashing needed); otherwise both sides are hashed ->
+`HASH_MISMATCH` (re-hashed once before being reported, so a file that was
+still being written or briefly locked isn't flagged falsely) or a match.
+Files that exist only in the destination are `EXTRA_IN_DEST` (not reported
+when sampling). Unreadable files/folders are `READ_ERROR`, never silently
+skipped.
+
+Ways to run it:
+
+* **Verify Checksums...** on the Sync tab or per selected job on the Job
+  Queue tab - a window with algorithm, thread count, sample %, a live
+  progress bar, a sortable/filterable result table and CSV export.
+* **Verify file checksums after a successful sync** (Sync tab checkbox) -
+  opens the window and starts automatically after a live manual sync; the
+  summary and CSV report are attached to that run in Run History.
+* **Verify file checksums after each successful run** (job editor, with a
+  sample %) - runs after scheduled runs and Run Now, in the background. The
+  report is saved under `job_reports/<job>_<run>_checksum_report.csv`, the
+  Run History **Checksum Verify** column shows the outcome, and **View
+  Checksum Report** opens it. A scheduled run with any mismatch exits
+  non-zero so Task Scheduler shows it as failed.
+* Command line: `python verify_checksums.py SOURCE DEST --threads 16
+  --sample 10 --report checksums.csv` (exit code 1 on any problem).
+
+**Cost.** This re-reads all verified data from both shares through the host
+running TFSync, so it roughly doubles the read traffic of the migration.
+For large datasets use a **sample** (deterministic - the same files every
+time) for routine runs and a full pass once, after cutover, ideally from a
+host close to the storage with a higher thread count. Reports use the same
+columns as the ACL report (`RelativePath, ItemType, DifferenceType, Detail,
+SourceValue, DestValue`), with the digests in `SourceValue`/`DestValue` for
+mismatches.
+
 ## Long paths (260+ characters)
 
 Windows' classic `MAX_PATH` is 260 characters (including the terminating
@@ -365,6 +407,8 @@ decode_mask.py                         Standalone access-mask decoder (cross-pla
 tfsync_store.py                        SQLite job/run-history store + LicenseManager/UsageTracker stubs (cross-platform, no Windows deps)
 task_scheduler.py                      Schedule expression parsing (cross-platform) + schtasks.exe wrapper (Windows only)
 run_scheduled_job.py                   Headless entry point Task Scheduler invokes to actually run one job
+checksum_verify.py                     Content verification: SHA-256 (etc.) compare of source vs destination files (cross-platform)
+verify_checksums.py                    Command-line interface (checksum verification)
 long_path_scan.py                      Long-path (>=260 char) scan, \\?\UNC\ syntax helpers, LongPathsEnabled registry check, scope statement (cross-platform)
 credential_manager.py                  Source/dest share credentials via Windows Credential Manager (cmdkey.exe wrapper, Windows only)
 requirements.txt                       Python dependencies
