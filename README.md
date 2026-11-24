@@ -23,7 +23,7 @@ current logged-on-only limitation). Nothing major left from the original
 design brief; remaining ideas are refinements (e.g. a credential-prompt
 flow to support running fully logged-off/rebooted, not just logged-on).
 
-## Job Queue (GUI tab 3)
+## Job Queue (GUI tab 4)
 
 Define reusable sync jobs (name, source, dest, mode, thread/retry settings,
 optional auto-chained ACL verification, and an optional **Schedule**) and
@@ -163,7 +163,7 @@ hand-editing the exported file before importing it back.
   are enabled and scheduled get their Task Scheduler task registered
   automatically, the same as creating them by hand.
 
-## Run History (GUI tab 4)
+## Run History (GUI tab 5)
 
 Every sync run - manual (from tab 1) or from the Job Queue - is logged to
 a local SQLite database (`tfsync_store.py`), including start/end time,
@@ -319,11 +319,14 @@ skipped.
 
 Ways to run it:
 
-* **Verify Checksums...** on the Sync tab or per selected job on the Job
-  Queue tab - a window with algorithm, thread count, sample %, a live
-  progress bar, a sortable/filterable result table and CSV export.
+* **Tab "3. Compare Checksums"** - same layout as Compare ACLs: it uses the
+  shared Source/Destination fields (or *Load from Job Queue*), with algorithm,
+  threads, sample %, a live progress bar, a sortable/filterable result table
+  (filter by difference type) and CSV export. The **Verify Checksums...**
+  buttons on the Sync tab and the Job Queue tab (for the selected job) jump
+  straight to it.
 * **Verify file checksums after a successful sync** (Sync tab checkbox) -
-  opens the window and starts automatically after a live manual sync; the
+  switches to the Compare Checksums tab and starts automatically after a live manual sync; the
   summary and CSV report are attached to that run in Run History.
 * **Verify file checksums after each successful run** (job editor, with a
   sample %) - runs after scheduled runs and Run Now, in the background. The

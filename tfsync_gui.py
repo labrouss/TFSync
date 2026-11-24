@@ -335,27 +335,25 @@ class ChecksumWorker(QThread):
             self.failed.emit(str(e))
 
 
-class ChecksumVerifyDialog(QDialog):
+class ChecksumVerifyPanel(QWidget):
     """
-    Content verification after a sync: hashes every file in the source and
+    Content of tab "3. Compare Checksums". Content verification after a sync: hashes every file in the source and
     destination (SHA-256 by default) and lists anything that differs. robocopy
     never compares file contents, so this is the data-integrity counterpart to
-    the ACL comparison. When opened for a recorded run (run_id), the summary
-    and CSV report are attached to that run in Run History automatically.
+    the ACL comparison. Uses the Source/Destination fields shared by all tabs.
+    When started for a recorded run (run_id, e.g. right after a manual sync),
+    the summary and CSV report are attached to that run in Run History.
     """
 
-    def __init__(self, parent, source: str, dest: str, threads: int = 8, sample_pct: int = 100,
-                 job_name: str = "", run_id: Optional[str] = None, auto_start: bool = False):
-        super().__init__(parent)
-        self._parent_window = parent
-        self.source, self.dest, self.run_id = source, dest, run_id
-        self.job_name = job_name
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self._parent_window = main_window
+        self.source = self.dest = ""
+        self.run_id: Optional[str] = None
+        self.job_name = ""
         self.rows: List[dict] = []
         self.counts: Optional[dict] = None
         self.worker: Optional[ChecksumWorker] = None
-        self.setWindowTitle("Verify Checksums" + (f" - {job_name}" if job_name else ""))
-        self.setWindowModality(Qt.NonModal)
-        self.resize(980, 680)
 
         root = QVBoxLayout(self)
         note = QLabel(
@@ -367,12 +365,13 @@ class ChecksumVerifyDialog(QDialog):
         note.setStyleSheet("color: #999; font-style: italic;")
         root.addWidget(note)
 
-        box = QGroupBox("Verification")
+        box = QGroupBox("Checksum Comparison Options")
         form = QFormLayout(box)
-        for label, text in (("Source:", source), ("Destination:", dest)):
-            lbl = QLabel(text)
-            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            form.addRow(label, lbl)
+        self.job_combo = QComboBox()
+        self.job_combo.addItem("\u2014 Select a job from the queue \u2014", None)
+        self.job_combo.setToolTip("Pick a saved job to load its source/dest/threads/sample % into the fields above and this tab.")
+        self.job_combo.currentIndexChanged.connect(self._on_job_selected)
+        form.addRow("Load from Job Queue:", self.job_combo)
 
         opts = QHBoxLayout()
         self.algo_combo = QComboBox()
@@ -380,12 +379,12 @@ class ChecksumVerifyDialog(QDialog):
         self.algo_combo.setToolTip("Hash algorithm. SHA-256 is the default; MD5/SHA-1 are faster but weaker.")
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 64)
-        self.threads_spin.setValue(max(1, min(64, threads)))
+        self.threads_spin.setValue(8)
         self.threads_spin.setToolTip("Files hashed in parallel (each file is read from both sides).")
         self.sample_spin = QSpinBox()
         self.sample_spin.setRange(1, 100)
         self.sample_spin.setSuffix(" %")
-        self.sample_spin.setValue(sample_pct)
+        self.sample_spin.setValue(100)
         self.sample_spin.setToolTip(
             "Percentage of files to verify. The sample is deterministic (the same files are chosen "
             "every time). Below 100% extra files in the destination are not reported."
@@ -393,7 +392,7 @@ class ChecksumVerifyDialog(QDialog):
         self.matches_chk = QCheckBox("Include identical files in report")
         self.matches_chk.setToolTip("Adds a MATCH row with the digest for every verified file. Makes the report large.")
         self.start_btn = QPushButton("Start Verification")
-        self.start_btn.clicked.connect(self.start)
+        self.start_btn.clicked.connect(lambda: self.start())
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self.cancel)
@@ -451,15 +450,41 @@ class ChecksumVerifyDialog(QDialog):
         self.export_btn = QPushButton("Export CSV...")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self.export_csv)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.close)
         btns.addWidget(self.export_btn)
         btns.addStretch()
-        btns.addWidget(close_btn)
         root.addLayout(btns)
 
-        if auto_start:
-            QTimer.singleShot(0, self.start)
+    def refresh_job_combo(self) -> None:
+        current = self.job_combo.currentData()
+        self.job_combo.blockSignals(True)
+        self.job_combo.clear()
+        self.job_combo.addItem("\u2014 Select a job from the queue \u2014", None)
+        for job in store.list_jobs():
+            self.job_combo.addItem(job["name"], job["job_id"])
+        idx = self.job_combo.findData(current)
+        self.job_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.job_combo.blockSignals(False)
+
+    def _on_job_selected(self, _index: int) -> None:
+        job_id = self.job_combo.currentData()
+        job = store.get_job(job_id) if job_id else None
+        if not job:
+            return
+        self.load_job(job)
+
+    def load_job(self, job: dict) -> None:
+        w = self._parent_window
+        w.source_edit.setText(job["source"])
+        w.dest_edit.setText(job["dest"])
+        self.threads_spin.setValue(max(1, min(64, int(job["threads"]))))
+        self.sample_spin.setValue(int(job["checksum_sample_pct"]))
+        self.job_name = job["name"]
+        self.run_id = None
+        idx = self.job_combo.findData(job["job_id"])
+        if idx >= 0:
+            self.job_combo.blockSignals(True)
+            self.job_combo.setCurrentIndex(idx)
+            self.job_combo.blockSignals(False)
 
     def _apply_filter(self) -> None:
         kind = self.type_combo.currentText()
@@ -470,9 +495,15 @@ class ChecksumVerifyDialog(QDialog):
             self.proxy.setFilterKeyColumn(2)
             self.proxy.setFilterFixedString(kind)
 
-    def start(self) -> None:
+    def start(self, run_id: Optional[str] = None) -> None:
         if self.worker and self.worker.isRunning():
             return
+        self.source = self._parent_window.source_edit.text().strip()
+        self.dest = self._parent_window.dest_edit.text().strip()
+        if not self.source or not self.dest:
+            QMessageBox.information(self, APP_TITLE, "Enter a source and destination first.")
+            return
+        self.run_id = run_id
         self.model.removeRows(0, self.model.rowCount())
         self.rows = []
         self.counts = None
@@ -573,11 +604,6 @@ class ChecksumVerifyDialog(QDialog):
             return
         QMessageBox.information(self, APP_TITLE, f"Exported {len(self.rows):,} rows to\n{path}")
 
-    def closeEvent(self, event) -> None:
-        if self.worker and self.worker.isRunning():
-            self.worker.cancel()
-            self.worker.wait(5000)
-        super().closeEvent(event)
 
 
 class LongPathScanWorker(QThread):
@@ -1857,8 +1883,11 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_sync_tab(), "1. Sync (robocopy)")
         self.tabs.addTab(self._build_compare_tab(), "2. Compare ACLs")
-        self.tabs.addTab(self._build_queue_tab(), "3. Job Queue")
-        self.tabs.addTab(self._build_history_tab(), "4. Run History")
+        self.checksum_panel = ChecksumVerifyPanel(self)
+        self.tabs.addTab(self.checksum_panel, "3. Compare Checksums")
+        self.checksum_panel.refresh_job_combo()
+        self.tabs.addTab(self._build_queue_tab(), "4. Job Queue")
+        self.tabs.addTab(self._build_history_tab(), "5. Run History")
         root_layout.addWidget(self.tabs, 1)
 
         # Auto-fill resolve-host / output filename / sync log from the
@@ -2064,16 +2093,23 @@ class MainWindow(QMainWindow):
             job_id = store.create_job(**values)
             self.refresh_jobs_table()
             self._sync_job_schedule(job_id, password=password)
-            self.tabs.setCurrentIndex(2)  # Job Queue tab
+            self.tabs.setCurrentIndex(3)  # Job Queue tab
 
-    def _open_checksum_dialog(self, source: str, dest: str, threads: int = 8, sample_pct: int = 100,
-                              job_name: str = "", run_id: Optional[str] = None, auto_start: bool = False) -> None:
-        dialog = ChecksumVerifyDialog(self, source, dest, threads=threads, sample_pct=sample_pct,
-                                      job_name=job_name, run_id=run_id, auto_start=auto_start)
-        if not hasattr(self, "_checksum_dialogs"):
-            self._checksum_dialogs = []
-        self._checksum_dialogs.append(dialog)   # non-modal: keep a reference
-        dialog.show()
+    CHECKSUM_TAB_INDEX = 2
+
+    def _show_checksum_tab(self, source: str, dest: str, threads: Optional[int] = None,
+                           run_id: Optional[str] = None, auto_start: bool = False) -> None:
+        """Fills the shared Source/Destination fields and switches to the
+        Compare Checksums tab, optionally starting the verification."""
+        self.source_edit.setText(source)
+        self.dest_edit.setText(dest)
+        self.checksum_panel.job_name = ""
+        self.checksum_panel.run_id = None
+        if threads:
+            self.checksum_panel.threads_spin.setValue(max(1, min(64, int(threads))))
+        self.tabs.setCurrentIndex(self.CHECKSUM_TAB_INDEX)
+        if auto_start:
+            self.checksum_panel.start(run_id=run_id)
 
     def on_verify_checksums(self) -> None:
         source = self.source_edit.text().strip()
@@ -2081,7 +2117,7 @@ class MainWindow(QMainWindow):
         if not source or not dest:
             QMessageBox.information(self, APP_TITLE, "Enter a source and destination first.")
             return
-        self._open_checksum_dialog(source, dest, threads=self.sync_threads_spin.value())
+        self._show_checksum_tab(source, dest, threads=self.sync_threads_spin.value())
 
     def on_verify_job_checksums(self) -> None:
         job_id = self._selected_job_id()
@@ -2090,8 +2126,8 @@ class MainWindow(QMainWindow):
             return
         job = store.get_job(job_id)
         if job:
-            self._open_checksum_dialog(job["source"], job["dest"], threads=job["threads"],
-                                       sample_pct=job["checksum_sample_pct"], job_name=job["name"])
+            self.tabs.setCurrentIndex(self.CHECKSUM_TAB_INDEX)
+            self.checksum_panel.load_job(job)
 
     def on_scan_long_paths(self) -> None:
         source = self.source_edit.text().strip()
@@ -2475,6 +2511,8 @@ class MainWindow(QMainWindow):
         return info.get("Next Run Time", "Unknown")
 
     def _refresh_compare_job_combo(self) -> None:
+        if hasattr(self, "checksum_panel"):
+            self.checksum_panel.refresh_job_combo()
         if not hasattr(self, "compare_job_combo"):
             return
         current_id = self.compare_job_combo.currentData()
@@ -3413,7 +3451,7 @@ class MainWindow(QMainWindow):
 
         if (not dry_run and not result["cancelled"] and self.sync_verify_checksum_chk.isChecked()
                 and not robocopy_sync.is_failure(result["exit_code"])):
-            self._open_checksum_dialog(
+            self._show_checksum_tab(
                 self._sync_source, self._sync_dest, threads=self.sync_threads_spin.value(),
                 run_id=self._last_manual_run_id, auto_start=True,
             )
