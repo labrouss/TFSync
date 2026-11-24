@@ -544,8 +544,8 @@ RelativePath, ItemType, DifferenceType, Detail, SourceValue, DestValue
 - `ACE_MISSING_IN_DEST` / `ACE_ADDED_IN_DEST` - individual ACE differences
 - `READ_ERROR` - security descriptor couldn't be read on one or both sides
   (check `Detail` for the exact Win32 error)
-- `MATCH` - no differences found (only present with `--show-matches` /
-  "Include matching items")
+- `MATCH` - no differences found (listed by default in the GUI unless you tick
+  "Exclude matching items from report"; on the command line only present with `--show-matches`)
 
 In the GUI, once a comparison finishes, **View CSV** opens the report in
 an interactive, sortable table - the same browsing experience as watching

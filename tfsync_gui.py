@@ -2250,8 +2250,9 @@ class MainWindow(QMainWindow):
         self.dirs_only_chk.setToolTip("Compares only folder ACLs, skipping every individual file - much faster on large trees, at the cost of not catching file-level permission differences.")
         form.addRow("", self.dirs_only_chk)
 
-        self.show_matches_chk = QCheckBox("Include matching items in report (shown as MATCH rows)")
-        self.show_matches_chk.setToolTip("By default only differences are reported. Check this to also include a MATCH row for every item that's identical - useful for a complete audit trail, but makes for a much longer report.")
+        self.show_matches_chk = QCheckBox("Exclude matching items from report (hide MATCH rows)")
+        self.show_matches_chk.setToolTip("By default every compared item is listed, including identical ones (as a MATCH row) - a complete audit trail of what was checked. Check this to list only differences, which keeps the table and CSV much smaller on large trees.")
+        self.show_matches_chk.setChecked(False)
         form.addRow("", self.show_matches_chk)
 
         self.threads_spin = QSpinBox()
@@ -3557,7 +3558,7 @@ class MainWindow(QMainWindow):
         resolve_host = self.resolve_host_edit.text().strip() or None
         self.worker = ScanWorker(
             source, dest, self.dirs_only_chk.isChecked(), resolve_host,
-            self.threads_spin.value(), self.show_matches_chk.isChecked(),
+            self.threads_spin.value(), not self.show_matches_chk.isChecked(),
         )
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.update_progress)
@@ -3611,7 +3612,7 @@ class MainWindow(QMainWindow):
         status = "CANCELLED" if counts.get("cancelled") else "COMPLETE"
         self.progress_bar.setFormat(f"{status} - {self.progress_bar.value()} items compared")
 
-        match_label = "Matching" if self.show_matches_chk.isChecked() else "Matching (not shown in table)"
+        match_label = "Matching (not shown in table)" if self.show_matches_chk.isChecked() else "Matching"
         summary = (
             f"[{status}]  "
             f"Missing in dest: {counts['missing']}  |  "
