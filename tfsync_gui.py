@@ -211,7 +211,8 @@ JOB_COLUMNS = ["Name", "Source", "Destination", "Mode", "Schedule", "Threads",
 JOB_EXPORT_FIELDS = ["name", "source", "dest", "mode", "schedule_expr",
                       "threads", "retries", "auto_verify_acl", "enabled", "run_as_user",
                       "source_username", "dest_username", "long_paths",
-                      "auto_verify_checksum", "checksum_sample_pct"]
+                      "auto_verify_checksum", "checksum_sample_pct",
+                      "checksum_algorithm", "checksum_exclude_identical"]
 
 HISTORY_COLUMNS = ["Start Time (local)", "Job", "Source", "Destination", "Mode", "Dry Run",
                     "Duration", "Files Copied", "Bytes Copied", "MB/s", "Exit",
@@ -485,6 +486,10 @@ class ChecksumVerifyPanel(QWidget):
         w.dest_edit.setText(job["dest"])
         self.threads_spin.setValue(max(1, min(64, int(job["threads"]))))
         self.sample_spin.setValue(int(job["checksum_sample_pct"]))
+        i = self.algo_combo.findText((job["checksum_algorithm"] or "sha256").upper())
+        if i >= 0:
+            self.algo_combo.setCurrentIndex(i)
+        self.matches_chk.setChecked(bool(job["checksum_exclude_identical"]))
         self.job_name = job["name"]
         self.run_id = None
         self.job_id = job["job_id"]
@@ -1612,6 +1617,27 @@ class JobEditorDialog(QDialog):
         checksum_row.addStretch()
         form.addRow("", checksum_row)
 
+        checksum_opts_row = QHBoxLayout()
+        self.checksum_algo_combo = QComboBox()
+        self.checksum_algo_combo.addItems([a.upper() for a in checksum_verify.ALGORITHMS])
+        self.checksum_algo_combo.setToolTip("Hash algorithm for this job's checksum verification (same choice as the Compare Checksums tab).")
+        algo = (job["checksum_algorithm"] if job and "checksum_algorithm" in job.keys() else "sha256") or "sha256"
+        idx = self.checksum_algo_combo.findText(algo.upper())
+        self.checksum_algo_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.checksum_exclude_chk = QCheckBox("Exclude identical files from the checksum report")
+        self.checksum_exclude_chk.setToolTip(
+            "By default the report lists every verified file (identical ones as MATCH rows with their digest) - "
+            "a complete record of what was checked. Tick this to list only problems, which keeps the report "
+            "small on very large shares. Same option as on the Compare Checksums tab."
+        )
+        self.checksum_exclude_chk.setChecked(
+            bool(job["checksum_exclude_identical"]) if job and "checksum_exclude_identical" in job.keys() else False)
+        checksum_opts_row.addWidget(QLabel("Checksum algorithm:"))
+        checksum_opts_row.addWidget(self.checksum_algo_combo)
+        checksum_opts_row.addWidget(self.checksum_exclude_chk)
+        checksum_opts_row.addStretch()
+        form.addRow("", checksum_opts_row)
+
         self.auto_verify_chk = QCheckBox("Automatically run ACL comparison after each successful run")
         self.auto_verify_chk.setToolTip(
             "After a successful (non-dry-run, non-cancelled) sync, automatically runs an "
@@ -1821,6 +1847,8 @@ class JobEditorDialog(QDialog):
             "long_paths": self.long_paths_chk.isChecked(),
             "auto_verify_checksum": self.auto_checksum_chk.isChecked(),
             "checksum_sample_pct": self.checksum_sample_spin.value(),
+            "checksum_algorithm": self.checksum_algo_combo.currentText().lower(),
+            "checksum_exclude_identical": self.checksum_exclude_chk.isChecked(),
             "enabled": self.enabled_chk.isChecked(),
             "run_as_user": self.runas_user_edit.text().strip() if self.runas_stored_radio.isChecked() else None,
             "source_username": self.source_cred_user_edit.text().strip() if self.source_creds_chk.isChecked() else None,
@@ -2831,6 +2859,10 @@ class MainWindow(QMainWindow):
             "long_paths": bool(entry.get("long_paths", False)),
             "auto_verify_checksum": bool(entry.get("auto_verify_checksum", False)),
             "checksum_sample_pct": max(1, min(100, int(entry.get("checksum_sample_pct", 100) or 100))),
+            "checksum_algorithm": (str(entry.get("checksum_algorithm") or "sha256").lower()
+                                   if str(entry.get("checksum_algorithm") or "sha256").lower() in checksum_verify.ALGORITHMS
+                                   else "sha256"),
+            "checksum_exclude_identical": bool(entry.get("checksum_exclude_identical", False)),
         }
 
     def on_import_jobs(self) -> None:
@@ -3040,12 +3072,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_TITLE, f"Checksum verification for \u201c{job['name']}\u201d could not start:\n{e}")
             return
 
-        worker = ChecksumWorker(job["source"], job["dest"], checksum_verify.DEFAULT_ALGORITHM,
-                                job["threads"], job["checksum_sample_pct"], False)
+        algorithm = job["checksum_algorithm"] or checksum_verify.DEFAULT_ALGORITHM
+        worker = ChecksumWorker(job["source"], job["dest"], algorithm, job["threads"],
+                                job["checksum_sample_pct"], not job["checksum_exclude_identical"])
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(checksum_verify.ROW_FIELDS)
         self._chain_log(log_path, f"checksum verification started ({job['checksum_sample_pct']}% of files, "
-                                  f"{checksum_verify.DEFAULT_ALGORITHM.upper()}); report: {report_path}")
+                                  f"{algorithm.upper()}"
+                                  f"{', problems only' if job['checksum_exclude_identical'] else ''}); report: {report_path}")
 
         def on_done(counts: dict) -> None:
             csv_file.close()

@@ -337,8 +337,8 @@ Ways to run it:
   failure reason) is appended to that run's log (**View Log**), and a failure
   is shown in the Run History column (`FAILED - see log` / `verification_failed`)
   and in a warning dialog instead of being silent.
-* **Verify file checksums after each successful run** (job editor, with a
-  sample %) - runs after scheduled runs and Run Now, in the background. The
+* **Verify file checksums after each successful run** (job editor, with the same
+  options as the tab: algorithm, sample %, and **Exclude identical files from the checksum report** - default is the full report) - runs after scheduled runs and Run Now, in the background. The
   report is saved under `job_reports/<job>_<run>_checksum_report.csv`, the
   Run History **Checksum Verify** column shows the outcome, and **View
   Checksum Report** opens it. A scheduled run with any mismatch exits
@@ -354,8 +354,8 @@ host close to the storage with a higher thread count. Reports use the same
 columns as the ACL report (`RelativePath, ItemType, DifferenceType, Detail,
 SourceValue, DestValue`), with the digests in `SourceValue`/`DestValue`. On the Compare Checksums
 tab identical files are listed too (as `MATCH` rows, a full record of what was
-checked) unless you tick **Exclude identical files from report**; automatic
-verification after job runs lists problems only.
+checked) unless you tick **Exclude identical files from report**; the same
+option exists per job (see below), default is the full report.
 
 ## Long paths (260+ characters)
 

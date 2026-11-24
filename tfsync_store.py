@@ -179,6 +179,10 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN auto_verify_checksum INTEGER NOT NULL DEFAULT 0")
     if "checksum_sample_pct" not in jobs_cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN checksum_sample_pct INTEGER NOT NULL DEFAULT 100")
+    if "checksum_algorithm" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN checksum_algorithm TEXT NOT NULL DEFAULT 'sha256'")
+    if "checksum_exclude_identical" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN checksum_exclude_identical INTEGER NOT NULL DEFAULT 0")
     if "checksum_summary_json" not in run_history_cols:
         conn.execute("ALTER TABLE run_history ADD COLUMN checksum_summary_json TEXT")
     if "checksum_report_path" not in run_history_cols:
@@ -209,6 +213,8 @@ def create_job(
     long_paths: bool = False,
     auto_verify_checksum: bool = False,
     checksum_sample_pct: int = 100,
+    checksum_algorithm: str = "sha256",
+    checksum_exclude_identical: bool = False,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> str:
     """Creates a job definition and returns its job_id."""
@@ -219,12 +225,14 @@ def create_job(
             """INSERT INTO jobs
                (job_id, name, source, dest, mode, schedule_expr, threads,
                 retries, auto_verify_acl, enabled, run_as_user, source_username,
-                dest_username, long_paths, auto_verify_checksum, checksum_sample_pct, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                dest_username, long_paths, auto_verify_checksum, checksum_sample_pct,
+                checksum_algorithm, checksum_exclude_identical, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, name, source, dest, mode, schedule_expr, threads,
              retries, int(auto_verify_acl), int(enabled), run_as_user or None,
              source_username or None, dest_username or None, int(long_paths),
-             int(auto_verify_checksum), int(checksum_sample_pct), now, now),
+             int(auto_verify_checksum), int(checksum_sample_pct),
+             checksum_algorithm or "sha256", int(checksum_exclude_identical), now, now),
         )
     return job_id
 

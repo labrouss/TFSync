@@ -130,8 +130,9 @@ def main() -> int:
                 writer = csv.writer(f)
                 writer.writerow(checksum_verify.ROW_FIELDS)
                 ck_counts = checksum_verify.verify_trees(
-                    job["source"], job["dest"], algorithm=checksum_verify.DEFAULT_ALGORITHM,
+                    job["source"], job["dest"], algorithm=job["checksum_algorithm"],
                     max_workers=job["threads"], sample_pct=job["checksum_sample_pct"],
+                    include_matches=not job["checksum_exclude_identical"],
                     row_cb=lambda r: writer.writerow([r[k] for k in checksum_verify.ROW_FIELDS]),
                     log_cb=lambda m: print(m, flush=True),
                 )
